@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth
+from app.api import auth, documents
 from app.core.database import init_db
 from app.core.exceptions import register_exception_handlers
 
@@ -28,6 +28,7 @@ app.add_middleware(
 register_exception_handlers(app)
 
 app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
+app.include_router(documents.router, prefix="/api/documents", tags=["文档"])
 
 
 @app.get("/health")
