@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -56,3 +58,14 @@ app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
 @app.get("/health")
 async def health():
     return {"code": 0, "message": "ok", "data": {"status": "up"}}
+
+
+# ---------- 前端静态资源 ----------
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """根路径返回落地页。"""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
