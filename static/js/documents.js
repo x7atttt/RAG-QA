@@ -13,7 +13,7 @@
 
     document.getElementById("logoutBtn").addEventListener("click", () => {
         Token.clear();
-        location.href = "login.html";
+        location.href = "/login.html";
     });
 
     // ---------- Toast ----------
@@ -165,7 +165,7 @@
             });
             if (resp.status === 401) {
                 Token.clear();
-                location.href = "login.html";
+                location.href = "/login.html";
                 return;
             }
             const payload = await resp.json().catch(() => null);

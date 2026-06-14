@@ -16,8 +16,8 @@
                 <i class="bi bi-robot me-2"></i>DocQA
             </a>
             <div class="d-flex">
-                <a href="login.html" class="btn btn-outline-light btn-sm me-2">登录</a>
-                <a href="login.html" class="btn btn-light btn-sm">开始使用</a>
+                <a href="/login.html" class="btn btn-outline-light btn-sm me-2">登录</a>
+                <a href="/login.html" class="btn btn-light btn-sm">开始使用</a>
             </div>
         </div>
     </nav>
@@ -27,7 +27,7 @@
         <div class="container text-center py-5">
             <h1 class="display-4 fw-bold mb-3">AI 智能文档问答系统</h1>
             <p class="lead mb-4 text-white-50">上传文档，基于 RAG 检索增强生成，让 AI 基于你的内容精准回答</p>
-            <a href="login.html" class="btn btn-light btn-lg px-5 fw-semibold">
+            <a href="/login.html" class="btn btn-light btn-lg px-5 fw-semibold">
                 <i class="bi bi-arrow-right-circle me-2"></i>开始使用
             </a>
         </div>
@@ -85,7 +85,7 @@
     <section class="py-5 text-center">
         <div class="container">
             <h3 class="fw-bold mb-3">准备好开始了吗？</h3>
-            <a href="login.html" class="btn btn-primary btn-lg px-5">立即体验</a>
+            <a href="/login.html" class="btn btn-primary btn-lg px-5">立即体验</a>
         </div>
     </section>
 
@@ -97,7 +97,7 @@
     <script>
         // 已登录用户直接跳对话页，不留在落地页
         if (window.API.Token.exists()) {
-            location.href = "chat.html";
+            location.href = "/chat.html";
         }
     </script>
 </body>

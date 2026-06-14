@@ -95,8 +95,9 @@
     }
 
     function redirectLogin() {
+        // 同时兼容 /login.html 和 /static/login.html 两种访问路径
         if (!location.pathname.endsWith("login.html")) {
-            location.href = "login.html";
+            location.href = "/login.html";
         }
     }
 

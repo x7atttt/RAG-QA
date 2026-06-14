@@ -7,7 +7,7 @@
 
     // 已登录则直接跳对话页
     if (Token.exists()) {
-        location.href = "chat.html";
+        location.href = "/chat.html";
         return;
     }
 
@@ -43,7 +43,7 @@
     /** 登录成功后跳转 */
     function onAuthSuccess(data) {
         Token.set(data.access_token, data.user);
-        location.href = "chat.html";
+        location.href = "/chat.html";
     }
 
     // ---------- 登录 ----------

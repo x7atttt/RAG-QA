@@ -69,3 +69,16 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def root():
     """根路径返回落地页。"""
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+# 前端页面根路径别名：让 /login、/documents、/chat 直接可访问
+# （页面物理位置在 /static/ 下，提供短路径避免相对路径错位）
+@app.get("/{page}.html", include_in_schema=False)
+async def page_alias(page: str):
+    """把 /login.html、/chat.html、/documents.html 等映射到 static 目录。"""
+    allowed = {"login", "documents", "chat", "index"}
+    target = os.path.join(STATIC_DIR, f"{page}.html")
+    if page not in allowed or not os.path.exists(target):
+        # 未识别页面 → 返回 404 页面（带正确状态码）
+        return FileResponse(os.path.join(STATIC_DIR, "404.html"), status_code=404)
+    return FileResponse(target)

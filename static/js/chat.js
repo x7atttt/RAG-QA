@@ -20,7 +20,7 @@
 
     document.getElementById("logoutBtn").addEventListener("click", () => {
         Token.clear();
-        location.href = "login.html";
+        location.href = "/login.html";
     });
 
     const chatBox = document.getElementById("chatBox");
@@ -196,7 +196,7 @@
 
             if (resp.status === 401) {
                 Token.clear();
-                location.href = "login.html";
+                location.href = "/login.html";
                 return;
             }
             if (!resp.ok && !resp.headers.get("content-type")?.includes("text/event-stream")) {

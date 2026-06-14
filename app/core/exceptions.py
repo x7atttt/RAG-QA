@@ -1,9 +1,14 @@
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.response import ResponseCode, error_response
+
+# 静态目录（用于 404 时返回友好的 HTML 页面）
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static")
 
 
 class BizError(Exception):
@@ -19,6 +24,13 @@ class AuthError(BizError):
         super().__init__(code, message, http_status)
 
 
+def _wants_html(request: Request) -> bool:
+    """判断客户端是否期望 HTML 响应（浏览器导航场景）。"""
+    accept = request.headers.get("accept", "")
+    # 浏览器请求页面时 Accept 通常含 text/html；fetch/API 调用一般是 application/json 或 */*
+    return "text/html" in accept and "application/json" not in accept.split(",")[0]
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(BizError)
     async def _biz_error_handler(_: Request, exc: BizError) -> JSONResponse:
@@ -29,7 +41,13 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(status_code=exc.http_status, content=error_response(exc.code, exc.message))
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse | FileResponse:
+        # 浏览器导航到不存在的页面 → 返回友好 HTML（而非裸 JSON）
+        if exc.status_code == 404 and _wants_html(request):
+            not_found = os.path.join(_STATIC_DIR, "404.html")
+            if os.path.exists(not_found):
+                return FileResponse(not_found, status_code=404)
+
         message = exc.detail if isinstance(exc.detail, str) else "请求错误"
         code_map = {
             401: ResponseCode.AUTH_FAILED,
