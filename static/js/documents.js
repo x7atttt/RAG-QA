@@ -65,6 +65,7 @@
 
     async function loadMore() {
         loadMoreBtn.classList.add("d-none");
+        const isRefresh = nextCursor === null; // loadFirst 触发：需清空旧内容
         try {
             const params = new URLSearchParams({ limit: "20" });
             if (nextCursor) params.set("cursor", nextCursor);
@@ -75,6 +76,7 @@
                     <i class="bi bi-inbox fs-1 d-block mb-2"></i>还没有文档，上传一个试试吧
                 </td></tr>`;
             } else {
+                if (isRefresh) tbody.innerHTML = ""; // 清掉"加载中..."占位
                 tbody.insertAdjacentHTML("beforeend", docs.map(rowHtml).join(""));
             }
             nextCursor = data.next_cursor;

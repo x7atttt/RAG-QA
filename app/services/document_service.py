@@ -153,6 +153,9 @@ async def process_document(
 
 
 async def delete_document(document: Document, db: AsyncSession) -> None:
+    import logging
+
+    logger = logging.getLogger("docqa.document")
     document_id = document.id
     user_id = document.user_id
     await db.delete(document)
@@ -161,9 +164,12 @@ async def delete_document(document: Document, db: AsyncSession) -> None:
     try:
         async with _chroma_lock:
             collection = get_user_collection(user_id)
+            # document_id 在 metadata 里存的是 int，where 过滤需用同类型
             collection.delete(where={"document_id": document_id})
-    except Exception:
-        pass
+            logger.info(f"已清理文档 {document_id} 在向量库中的向量 (user={user_id})")
+    except Exception as e:
+        # 不再静默吞异常：记录日志，便于发现向量库与元数据不一致
+        logger.warning(f"清理文档 {document_id} 向量失败（向量库可能有残留）: {e}")
 
 
 def save_upload_file(content: bytes, ext: str) -> tuple[str, str]:

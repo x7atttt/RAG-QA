@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import threading
+import warnings
 from typing import Any
 
 from FlagEmbedding import BGEM3FlagModel
@@ -7,6 +9,11 @@ from FlagEmbedding import BGEM3FlagModel
 from app.config import get_settings
 
 settings = get_settings()
+
+# 过滤 FlagEmbedding 内部的 XLMRobertaTokenizerFast 提示（库内部用 encode+pad
+# 而非 __call__，属于库的实现细节，不影响功能）
+warnings.filterwarnings("ignore", message=".*XLMRobertaTokenizerFast.*")
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
 _model: BGEM3FlagModel | None = None
 _lock = threading.Lock()
