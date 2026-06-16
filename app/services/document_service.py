@@ -76,10 +76,17 @@ def _chunk_text_sync(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 
 def chunk_text(text: str, chunk_size: int | None = None, overlap: int | None = None) -> list[str]:
-    return _chunk_text_sync(
+    """向后兼容的包装：等价于 split_text(strategy="fixed")。
+
+    保留是为了兼容 tests/test_chunking.py 的旧用例；生产路径已改用 split_text。
+    """
+    from app.services.text_splitter import split_text
+
+    return split_text(
         text,
-        chunk_size if chunk_size is not None else settings.chunk_size,
-        overlap if overlap is not None else settings.chunk_overlap,
+        strategy="fixed",
+        chunk_size=chunk_size if chunk_size is not None else settings.chunk_size,
+        chunk_overlap=overlap if overlap is not None else settings.chunk_overlap,
     )
 
 
@@ -112,7 +119,12 @@ async def process_document(
             http_status=400,
         )
 
-    chunks = await asyncio.to_thread(_chunk_text_sync, text, settings.chunk_size, settings.chunk_overlap)
+    # 分块：按配置策略切分（fixed/markdown/recursive），修复原来直调 _chunk_text_sync 绕过策略的 bug
+    from app.services.text_splitter import split_text
+
+    chunks = await asyncio.to_thread(
+        split_text, text, settings.split_strategy, settings.chunk_size, settings.chunk_overlap
+    )
     if not chunks:
         raise BizError(code=ResponseCode.DOC_PARSE_FAILED, message="文档内容为空", http_status=400)
 
