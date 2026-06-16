@@ -40,6 +40,190 @@
 
     let streaming = false; // 是否正在接收流（防止并发）
 
+    // ---------- 会话管理 ----------
+    let currentConvId = null; // 当前会话 id
+    const convList = document.getElementById("convList");
+    const newConvBtn = document.getElementById("newConvBtn");
+    const chatSidebar = document.getElementById("chatSidebar");
+
+    // Toast
+    const toastEl = document.getElementById("toast");
+    const toast = new bootstrap.Toast(toastEl, { delay: 2500 });
+    function showToast(msg, type = "primary") {
+        toastEl.className = `toast align-items-center text-bg-${type} border-0`;
+        document.getElementById("toastBody").textContent = msg;
+        toast.show();
+    }
+
+    // 移动端侧边栏切换
+    document.getElementById("sidebarToggle").addEventListener("click", () => {
+        chatSidebar.classList.toggle("open");
+    });
+
+    /** 渲染会话列表 */
+    function renderConvList(convs) {
+        if (!convs.length) {
+            convList.innerHTML = `<div class="text-center text-muted small py-4">暂无会话，点击"新建"开始</div>`;
+            return;
+        }
+        convList.innerHTML = convs
+            .map((c) => {
+                const active = c.id === currentConvId ? "active" : "";
+                return `<div class="conv-item ${active}" data-id="${c.id}">
+                    <span class="conv-title" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</span>
+                    <button class="conv-del" title="删除"><i class="bi bi-trash"></i></button>
+                </div>`;
+            })
+            .join("");
+    }
+
+    /** 加载会话列表 */
+    async function loadConversations() {
+        try {
+            const data = await window.API.fetchJSON(ENDPOINTS.chat.conversations);
+            renderConvList(data.conversations || []);
+            return data.conversations || [];
+        } catch (err) {
+            convList.innerHTML = `<div class="text-danger small p-2">${escapeHtml(err.message)}</div>`;
+            return [];
+        }
+    }
+
+    /** 新建会话 */
+    async function createConversation() {
+        try {
+            const data = await window.API.fetchJSON(ENDPOINTS.chat.conversations, { method: "POST" });
+            currentConvId = data.id;
+            await loadConversations();
+            // 高亮新会话 + 清空 chatBox
+            renderConvList((await loadConversations()) || []);
+            highlightConv(currentConvId);
+            clearChatBox();
+            closeSidebarMobile();
+        } catch (err) {
+            showToast(err.message, "danger");
+        }
+    }
+
+    function highlightConv(id) {
+        convList.querySelectorAll(".conv-item").forEach((el) => {
+            el.classList.toggle("active", Number(el.dataset.id) === id);
+        });
+    }
+
+    function closeSidebarMobile() {
+        chatSidebar.classList.remove("open");
+    }
+
+    function clearChatBox() {
+        chatBox.innerHTML = `<div class="text-center text-muted py-5">
+            <i class="bi bi-robot fs-1 d-block mb-3"></i>
+            <h5 class="fw-normal">开始新的对话</h5>
+            <p class="small">在下方输入你的问题</p>
+        </div>`;
+    }
+
+    /** 切换会话：加载历史消息 */
+    async function switchConversation(id) {
+        if (streaming) {
+            showToast("请等待当前回答完成", "warning");
+            return;
+        }
+        currentConvId = id;
+        highlightConv(id);
+        closeSidebarMobile();
+        chatBox.innerHTML = `<div class="text-center text-muted py-5"><div class="spinner-border spinner-border-sm"></div> 加载历史...</div>`;
+        try {
+            const data = await window.API.fetchJSON(
+                `${ENDPOINTS.chat.history}?conversation_id=${id}&limit=50`
+            );
+            renderHistoryMessages(data.messages || []);
+        } catch (err) {
+            chatBox.innerHTML = `<div class="text-center text-danger py-5">${escapeHtml(err.message)}</div>`;
+        }
+    }
+
+    /** 渲染历史消息（区分 user/assistant，复用 markdown + reasoning + sources 渲染）*/
+    function renderHistoryMessages(messages) {
+        if (!messages.length) {
+            clearChatBox();
+            return;
+        }
+        chatBox.innerHTML = "";
+        // messages 是倒序的（最新在前），反转为正序渲染
+        messages.slice().reverse().forEach((m) => {
+            if (m.role === "user") {
+                appendUserMsg(m.content);
+            } else {
+                const { contentEl, reasoningBox, reasoningEl, sourcesArea } = createAssistantMsg();
+                // 渲染完整答案
+                contentEl.innerHTML = renderMarkdown(m.content);
+                contentEl.querySelectorAll("pre code").forEach((b) => {
+                    if (window.hljs) try { window.hljs.highlightElement(b); } catch {}
+                });
+                // 推理过程（如有）
+                if (m.reasoning) {
+                    reasoningEl.innerHTML = `<pre class="reasoning-pre">${escapeHtml(m.reasoning)}</pre>`;
+                    reasoningBox.style.display = "block";
+                }
+                // 来源（如有）
+                if (m.sources && m.sources.length) {
+                    renderSources(sourcesArea, m.sources);
+                }
+            }
+        });
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    /** 删除会话（事件委托）*/
+    convList.addEventListener("click", async (e) => {
+        const delBtn = e.target.closest(".conv-del");
+        if (delBtn) {
+            e.stopPropagation();
+            const item = delBtn.closest(".conv-item");
+            const id = Number(item.dataset.id);
+            if (!confirm("确定删除该会话？所有消息将清除。")) return;
+            try {
+                await window.API.fetchJSON(ENDPOINTS.chat.deleteConversation(id), { method: "DELETE" });
+                showToast("删除成功", "success");
+                // 若删的是当前会话，切换到第一个或新建
+                if (id === currentConvId) {
+                    const convs = await loadConversations();
+                    if (convs.length) {
+                        await switchConversation(convs[0].id);
+                    } else {
+                        currentConvId = null;
+                        clearChatBox();
+                    }
+                } else {
+                    await loadConversations();
+                    highlightConv(currentConvId);
+                }
+            } catch (err) {
+                showToast(err.message, "danger");
+            }
+            return;
+        }
+        // 点击会话项 → 切换
+        const item = e.target.closest(".conv-item");
+        if (item) {
+            const id = Number(item.dataset.id);
+            if (id !== currentConvId) {
+                await switchConversation(id);
+            }
+        }
+    });
+
+    newConvBtn.addEventListener("click", createConversation);
+
+    // 页面初始化：加载会话列表 + 自动选中第一个
+    (async function init() {
+        const convs = await loadConversations();
+        if (convs.length) {
+            await switchConversation(convs[0].id);
+        }
+    })();
+
     // ---------- DOM 渲染辅助 ----------
     function appendUserMsg(text) {
         const el = document.createElement("div");
@@ -224,7 +408,7 @@
                     "Content-Type": "application/json",
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
-                body: JSON.stringify({ question, thinking }),
+                body: JSON.stringify({ question, thinking, conversation_id: currentConvId }),
             });
 
             if (resp.status === 401) {

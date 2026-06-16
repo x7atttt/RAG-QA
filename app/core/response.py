@@ -20,6 +20,8 @@ class ResponseCode:
 
     CHAT_CREATE_FAILED = 30001
     EMPTY_QUESTION = 30002
+    CONVERSATION_LIMIT_EXCEEDED = 30003
+    CONVERSATION_NOT_FOUND = 30004
 
 
 def success_response(data: Any = None, message: str = "success") -> dict:

@@ -3,10 +3,11 @@ import json
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.config import get_settings
 from app.core.cache import (
     acquire_lock,
     get_cached_answer,
@@ -18,10 +19,18 @@ from app.core.exceptions import BizError
 from app.core.rate_limit import limiter
 from app.core.response import ResponseCode, success_response
 from app.models import Conversation, Message, User
-from app.schemas.chat import ChatAskRequest, ChatHistoryData, MessageOut, SourceItem
+from app.schemas.chat import (
+    ChatAskRequest,
+    ChatHistoryData,
+    ConversationListData,
+    ConversationOut,
+    MessageOut,
+    SourceItem,
+)
 from app.services.chat_service import sse, stream_graph
 
 router = APIRouter()
+settings = get_settings()
 
 
 def _stream_cached(cached: dict, cache_tag: str):
@@ -54,12 +63,13 @@ async def ask(
 
     user_id = user.id
     thinking = bool(body.thinking)
+    conversation_id = body.conversation_id
 
-    # 取最近若干轮历史作为多轮上下文（正序：最旧在前）
-    history = await _load_recent_history(user_id, rounds=5)
+    # 取当前会话最近若干轮历史作为多轮上下文（正序：最旧在前）
+    history = await _load_recent_history(user_id, conversation_id, rounds=5)
 
-    # 缓存命中时需匹配 thinking 模式（开启/关闭 thinking 的答案不共享）
-    hit, cached = await get_cached_answer(user_id, question)
+    # 缓存按会话隔离（key 含 conversation_id）
+    hit, cached = await get_cached_answer(user_id, question, conversation_id)
     if hit and cached and cached.get("answer") and bool(cached.get("thinking", False)) == thinking:
         return StreamingResponse(
             _stream_cached(cached, "hit"),
@@ -67,19 +77,19 @@ async def ask(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    lock_token: str | None = await acquire_lock(user_id, question)
+    lock_token: str | None = await acquire_lock(user_id, question, conversation_id)
 
     if lock_token is None:
         for _ in range(8):
             await asyncio.sleep(0.3)
-            hit2, cached2 = await get_cached_answer(user_id, question)
+            hit2, cached2 = await get_cached_answer(user_id, question, conversation_id)
             if hit2 and cached2 and cached2.get("answer") and bool(cached2.get("thinking", False)) == thinking:
                 return StreamingResponse(
                     _stream_cached(cached2, "wait"),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
-        lock_token = await acquire_lock(user_id, question)
+        lock_token = await acquire_lock(user_id, question, conversation_id)
         if lock_token is None:
             lock_token = "no-redis"
 
@@ -120,6 +130,7 @@ async def ask(
                     error_msg=error_msg,
                     lock_token=lock_token,
                     thinking=thinking,
+                    conversation_id=conversation_id,
                 )
             )
 
@@ -130,15 +141,15 @@ async def ask(
     )
 
 
-async def _load_recent_history(user_id: int, rounds: int = 5) -> list[dict]:
-    """读取当前用户最近 N 轮历史消息，返回正序（最旧在前）。
+async def _load_recent_history(
+    user_id: int, conversation_id: int | None, rounds: int = 5
+) -> list[dict]:
+    """读取指定会话最近 N 轮历史消息，返回正序（最旧在前）。
 
-    用于多轮上下文。注意：当前 history 端点是跨会话按时间倒序的消息流，
-    这里同样按全局最近消息取，不区分 conversation。
+    用于多轮上下文。conversation_id 为 None 时取全局最近消息（兼容旧调用）。
     """
     try:
         async with async_session_factory() as db:
-            # 取最近 rounds*2 条（user+assistant 各一），倒序取再反转成正序
             stmt = (
                 select(Message)
                 .join(Conversation, Message.conversation_id == Conversation.id)
@@ -146,9 +157,10 @@ async def _load_recent_history(user_id: int, rounds: int = 5) -> list[dict]:
                 .order_by(Message.id.desc())
                 .limit(rounds * 2)
             )
+            if conversation_id is not None:
+                stmt = stmt.where(Message.conversation_id == conversation_id)
             result = await db.execute(stmt)
             msgs = result.scalars().all()
-        # 反转为正序，并只保留 user/assistant 的文本内容
         history = [
             {"role": m.role, "content": m.content}
             for m in reversed(msgs)
@@ -168,23 +180,40 @@ async def _finalize(
     error_msg: str | None,
     lock_token: str | None,
     thinking: bool = False,
+    conversation_id: int | None = None,
 ) -> None:
     answer = "".join(answer_parts)
     reasoning = "".join(reasoning_parts) if reasoning_parts else ""
     if lock_token:
-        await release_lock(user_id, question, lock_token)
+        await release_lock(user_id, question, lock_token, conversation_id)
     if error_msg or not answer:
         return
     try:
-        await set_cached_answer(user_id, question, answer, sources, reasoning, thinking)
+        await set_cached_answer(user_id, question, answer, sources, conversation_id, reasoning, thinking)
     except Exception:
         pass
     try:
         async with async_session_factory() as db:
-            conv = Conversation(user_id=user_id, title=question[:50])
-            db.add(conv)
-            await db.flush()
-            conv_id = conv.id
+            # 复用指定会话（校验 user_id 防越权），否则新建
+            conv_id: int
+            if conversation_id is not None:
+                conv = await db.get(Conversation, conversation_id)
+                if conv and conv.user_id == user_id:
+                    # 首问时把"新对话"更新为问题摘要
+                    if conv.title == "新对话":
+                        conv.title = question[:20]
+                    conv_id = conv.id
+                else:
+                    # 会话不存在或越权 → 新建
+                    conv = Conversation(user_id=user_id, title=question[:20])
+                    db.add(conv)
+                    await db.flush()
+                    conv_id = conv.id
+            else:
+                conv = Conversation(user_id=user_id, title=question[:20])
+                db.add(conv)
+                await db.flush()
+                conv_id = conv.id
             db.add(
                 Message(conversation_id=conv_id, role="user", content=question, sources=None)
             )
@@ -204,15 +233,20 @@ async def _finalize(
 
 @router.get("/history")
 async def history(
+    conversation_id: int = Query(..., description="会话 ID"),
     cursor: int | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # 校验会话归属当前用户
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user.id:
+        raise BizError(code=ResponseCode.CONVERSATION_NOT_FOUND, message="会话不存在", http_status=404)
+
     query = (
         select(Message)
-        .join(Conversation, Message.conversation_id == Conversation.id)
-        .where(Conversation.user_id == user.id)
+        .where(Message.conversation_id == conversation_id)
         .order_by(Message.id.desc())
     )
     if cursor is not None:
@@ -240,9 +274,71 @@ async def history(
                 role=m.role,
                 content=m.content,
                 sources=sources_list,
+                reasoning=m.reasoning,
                 created_at=m.created_at,
             )
         )
 
     data = ChatHistoryData(messages=out, next_cursor=next_cursor, has_next=has_next)
     return success_response(data.model_dump(mode="json"))
+
+
+# ---------- 会话管理 ----------
+
+
+@router.get("/conversations")
+async def list_conversations(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出当前用户所有会话，按 updated_at 倒序。"""
+    result = await db.execute(
+        select(Conversation)
+        .where(Conversation.user_id == user.id)
+        .order_by(Conversation.updated_at.desc())
+    )
+    convs = result.scalars().all()
+    out = [ConversationOut.model_validate(c) for c in convs]
+    data = ConversationListData(conversations=out, total=len(out))
+    return success_response(data.model_dump(mode="json"))
+
+
+@router.post("/conversations")
+async def create_conversation(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """新建空会话。达上限则拒绝创建。"""
+    # 检查上限
+    cnt_result = await db.execute(
+        select(func.count()).select_from(Conversation).where(Conversation.user_id == user.id)
+    )
+    count = cnt_result.scalar() or 0
+    if count >= settings.max_conversations:
+        raise BizError(
+            code=ResponseCode.CONVERSATION_LIMIT_EXCEEDED,
+            message=f"会话已达上限（{settings.max_conversations} 个），请先删除旧会话",
+            http_status=409,
+        )
+    conv = Conversation(user_id=user.id, title="新对话")
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return success_response(ConversationOut.model_validate(conv).model_dump(mode="json"), "创建成功")
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """删除会话及其所有消息（外键无 CASCADE，手动先删 Message）。"""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user.id:
+        raise BizError(code=ResponseCode.CONVERSATION_NOT_FOUND, message="会话不存在", http_status=404)
+    # 先删该会话所有消息，再删会话（防孤儿消息）
+    await db.execute(delete(Message).where(Message.conversation_id == conversation_id))
+    await db.delete(conv)
+    await db.commit()
+    return success_response(None, "删除成功")

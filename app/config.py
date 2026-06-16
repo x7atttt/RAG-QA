@@ -29,6 +29,8 @@ class Settings(BaseSettings):
 
     retrieve_top_k: int = 20
     rerank_top_k: int = 3
+    # 每用户最大会话数（超出拒绝创建，提示先删除旧会话）
+    max_conversations: int = 10
 
     cache_ttl_seconds: int = 1800
     cache_null_ttl_seconds: int = 60
