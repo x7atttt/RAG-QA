@@ -14,10 +14,11 @@
 | 🧩 **多策略分块** | auto 按文件类型路由（md→markdown，pdf/docx→recursive），可选 fixed/markdown/recursive |
 | 🔍 **RAG 检索增强** | bge-m3 向量检索（稠密+稀疏+ColBERT 多视图）+ bge-reranker-v2-m3 重排序 |
 | 🤖 **LangGraph Agent** | 状态图编排检索 → 重排 → 生成节点，意图路由按需检索 |
+| 💬 **多会话管理** | 侧边栏会话列表，新建/切换/删除，每用户上限 10 个，首问自动生成标题 |
 | 💡 **深度思考模式** | DeepSeek thinking 开关，推理过程可折叠查看（langchain-deepseek 原生 reasoning_content）|
 | ⚡ **SSE 流式输出** | Server-Sent Events 实时打字机效果，答案逐字呈现 |
-| 🔁 **多轮上下文** | 保留最近 5 轮对话历史，支持指代理解（"它""上面那个"）|
-| 🚀 **多级缓存 + 限流** | Redis 缓存（按 thinking 模式分桶，含空值防穿透）+ slowapi 令牌桶限流 |
+| 🔁 **多轮上下文** | 保留当前会话最近 5 轮历史，支持指代理解（"它""上面那个"）|
+| 🚀 **多级缓存 + 限流** | Redis 缓存（按会话+thinking 模式分桶隔离，含空值防穿透）+ slowapi 令牌桶限流 |
 | 🚫 **内容去重** | sha256 文件指纹，用户内去重，重复上传直接拒绝（省 embedding 算力）|
 | 📊 **上传进度** | XMLHttpRequest 真实进度条 + 超时处理 + 重复文档友好提示 |
 | 🔐 **JWT 认证** | 注册/登录、数据按用户隔离 |
@@ -136,6 +137,9 @@ CHUNK_OVERLAP=100
 SPLIT_STRATEGY=auto
 RETRIEVE_TOP_K=20
 RERANK_TOP_K=3
+
+# 会话管理
+MAX_CONVERSATIONS=10
 ```
 
 > 💡 **深度思考**：前端对话页有"深度思考"开关，开启后通过 DeepSeek `thinking` 模式输出推理过程（可折叠查看）。这是请求级开关，无需配置。
@@ -192,15 +196,19 @@ uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 | POST | `/api/documents/upload` | 上传文档（multipart，字段名 `file`） |
 | GET | `/api/documents/list` | 文档列表（游标分页 `cursor` / `limit`） |
 | DELETE | `/api/documents/{id}` | 删除文档 |
-| POST | `/api/chat/ask` | **SSE 流式问答**（`text/event-stream`） |
-| GET | `/api/chat/history` | 对话历史（游标分页） |
+| POST | `/api/chat/ask` | **SSE 流式问答**（可带 `conversation_id` 指定会话）|
+| GET | `/api/chat/conversations` | 会话列表（按 updated_at 倒序，含 total） |
+| POST | `/api/chat/conversations` | 新建空会话（达上限 10 个则拒绝）|
+| DELETE | `/api/chat/conversations/{id}` | 删除会话（级联清除消息）|
+| GET | `/api/chat/history` | 会话消息历史（必传 `conversation_id`，游标分页）|
 
 ### SSE 事件协议（`/api/chat/ask`）
 
 ```
 event: sources        data: [<来源卡片>]        # 检索结果，token 之前最多发一次
-event: token          data: <裸字符串>          # LLM 增量内容，逐字推送
-event: answer_final   data: <完整答案>          # 流末尾的完整答案
+event: reasoning      data: <裸字符串>          # 推理过程增量（thinking 模式开启时）
+event: token          data: <裸字符串>          # LLM 正式答案增量，逐字推送
+event: answer_final   data: {"answer":...,"reasoning":...}  # 完整答案与推理
 event: done           data: {"status":"ok"}     # 结束（命中缓存时带 cache 字段）
 event: error          data: {"message":"..."}   # 异常
 ```
@@ -242,6 +250,7 @@ uv run pytest
 | stage-5 | 多轮上下文（5 轮）+ 来源标注 + 意图路由 | ✅ |
 | stage-5 | 多策略分块（auto/markdown/recursive/fixed）| ✅ |
 | stage-5 | 内容去重（sha256）+ 上传进度条 + 超时 | ✅ |
+| stage-5 | 多会话管理（侧边栏/新建/切换/删除/上限10）| ✅ |
 | stage-5 | Docker 容器化部署 | ⏳ |
 
 ---
