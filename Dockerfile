@@ -34,10 +34,12 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 
 EXPOSE 8000
 
-# 健康检查（模型加载约 30s，start-period 给 60s 余量）
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" || exit 1
+# 健康检查（模型加载约 30-60s，start-period 给 120s 余量，间隔放宽避免误杀）
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=5 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
 
 # gunicorn 单 worker + uvicorn worker class（生产级进程管理）
-# 单 worker 因为模型常驻内存；--timeout 120 覆盖大文档解析 + LLM 流式
-CMD ["gunicorn", "app.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "120"]
+# --preload: master 进程预加载应用，worker 共享模型（省内存 + 加快重启）
+# --timeout 300: 覆盖 LLM 流式问答（可能数分钟）+ 大文档解析
+# --graceful-timeout 300: 优雅关闭等待时间，避免 SSE 流被中途杀断
+CMD ["gunicorn", "app.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "300", "--graceful-timeout", "300", "--preload"]
