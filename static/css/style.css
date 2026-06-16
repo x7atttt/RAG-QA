@@ -223,45 +223,33 @@ body {
     margin: 0.6rem 0 0.4rem;
 }
 
-/* 来源引用卡片 */
+/* 来源标注（气泡内顶部 chip 标签） */
 .sources-area {
-    max-width: 80%;
-    margin-left: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #e2e8f0;
 }
 
 .sources-label {
     color: #94a3b8;
+    font-size: 0.78rem;
     font-weight: 500;
 }
 
-.source-card {
-    background-color: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-left: 3px solid var(--brand);
-    border-radius: 8px;
-    padding: 0.6rem 0.85rem;
-    margin-bottom: 0.5rem;
-}
-
-.source-snippet {
-    line-height: 1.5;
-    max-height: 4.5em;
-    overflow: hidden;
-}
-
-/* 来源卡片展开后的完整原文 */
-.source-card[data-expanded="1"] .source-snippet {
-    max-height: none;
-    white-space: pre-wrap;
-}
-
-.src-expand {
-    font-size: 0.75rem;
-    text-decoration: none;
-    color: #94a3b8;
-}
-.src-expand:hover {
+.source-chip {
+    display: inline-flex;
+    align-items: center;
+    background-color: #eef2ff;
     color: var(--brand);
+    border: 1px solid #c7d2fe;
+    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1.5;
 }
 
 /* ===================== 推理过程折叠面板 ===================== */

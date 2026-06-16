@@ -52,13 +52,15 @@
     /**
      * 创建一条助手消息，返回：
      *   { row, contentEl, reasoningBox, reasoningEl, sourcesArea }
-     * reasoningBox: 推理折叠面板容器（<details>），初始隐藏；收到 reasoning 事件才显示
+     * - sourcesArea 在气泡内顶部（参考来源 chip 标注）
+     * - reasoningBox 推理折叠面板，初始隐藏
      */
     function createAssistantMsg() {
         const row = document.createElement("div");
         row.className = "msg-row assistant-row";
         row.innerHTML = `
             <div class="bubble assistant-bubble">
+                <div class="sources-area mb-2"></div>
                 <details class="reasoning-panel mb-2" style="display:none">
                     <summary class="reasoning-summary">
                         <i class="bi bi-lightbulb me-1"></i>推理过程
@@ -68,7 +70,6 @@
                 </details>
                 <div class="assistant-content"><span class="typing-cursor"></span></div>
             </div>
-            <div class="sources-area mt-2"></div>
         `;
         chatBox.appendChild(row);
         const contentEl = row.querySelector(".assistant-content");
@@ -89,53 +90,17 @@
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    // ---------- 来源卡片（点击展开完整原文）----------
+    // ---------- 来源标注（气泡内顶部 chip 标签，纯展示）----------
     function renderSources(areaEl, sources) {
         if (!sources || !sources.length) return;
-        const cards = sources
-            .map((s, i) => {
-                const name = escapeHtml(s.filename || "来源");
-                const score = typeof s.score === "number" ? (s.score * 100).toFixed(0) + "%" : "";
-                const fullContent = escapeHtml(s.content || "");
-                const snippet =
-                    escapeHtml((s.content || "").slice(0, 120)) + (s.content && s.content.length > 120 ? "…" : "");
-                return `<div class="source-card" data-full="${fullContent}">
-                    <div class="d-flex justify-content-between">
-                        <span class="fw-semibold"><i class="bi bi-link-45deg me-1"></i>${i + 1}. ${name}</span>
-                        <span>
-                            ${score ? `<span class="badge bg-success-subtle text-success">${score}</span>` : ""}
-                            <button class="btn btn-sm btn-link p-0 ms-1 src-expand"><i class="bi bi-arrows-expand"></i></button>
-                        </span>
-                    </div>
-                    <div class="source-snippet small text-muted mt-1">${snippet}</div>
-                </div>`;
-            })
+        // 提取不重复的文件名（多个 chunk 可能来自同一文档）
+        const names = [...new Set(sources.map((s) => s.filename).filter(Boolean))];
+        if (!names.length) return;
+        const chips = names
+            .map((n) => `<span class="source-chip"><i class="bi bi-file-earmark-text me-1"></i>${escapeHtml(n)}</span>`)
             .join("");
-        areaEl.innerHTML = `<div class="sources-label small text-muted mb-1"><i class="bi bi-quote me-1"></i>参考来源（模型基于以下文档片段回答）</div>${cards}`;
+        areaEl.innerHTML = `<span class="sources-label me-1"><i class="bi bi-quote"></i> 参考</span>${chips}`;
     }
-
-    // 点击来源卡片的展开按钮 → 切换显示完整原文
-    document.addEventListener("click", (e) => {
-        const btn = e.target.closest(".src-expand");
-        if (!btn) return;
-        const card = btn.closest(".source-card");
-        const snippetEl = card.querySelector(".source-snippet");
-        const full = card.dataset.full;
-        if (card.dataset.expanded === "1") {
-            // 收起：恢复摘要
-            snippetEl.textContent = (card.dataset.origSnippet || "") + ((card.dataset.origFull || "").length > 120 ? "…" : "");
-            card.dataset.expanded = "0";
-            btn.innerHTML = `<i class="bi bi-arrows-expand"></i>`;
-        } else {
-            if (!card.dataset.origSnippet) {
-                card.dataset.origSnippet = snippetEl.textContent.replace(/…$/, "");
-                card.dataset.origFull = full;
-            }
-            snippetEl.textContent = full;
-            card.dataset.expanded = "1";
-            btn.innerHTML = `<i class="bi bi-arrows-collapse"></i>`;
-        }
-    });
 
     // ---------- SSE 帧解析器（跨 chunk 缓冲）----------
     function createSSEParser(handlers) {
