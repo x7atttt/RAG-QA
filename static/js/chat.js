@@ -401,7 +401,15 @@
 
         try {
             const token = Token.get();
-            const thinking = thinkingToggle.checked;
+            // AbortController：60s 无数据则中止（防后端卡死），每收到帧重置
+            const controller = new AbortController();
+            let abortTimer;
+            const resetAbortTimer = () => {
+                clearTimeout(abortTimer);
+                abortTimer = setTimeout(() => controller.abort(), 60000);
+            };
+            window._chatAbortController = controller; // beforeunload 时可引用
+
             const resp = await fetch(ENDPOINTS.chat.ask, {
                 method: "POST",
                 headers: {
@@ -409,6 +417,7 @@
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
                 body: JSON.stringify({ question, thinking, conversation_id: currentConvId }),
+                signal: controller.signal,
             });
 
             if (resp.status === 401) {
@@ -423,19 +432,28 @@
 
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
+            resetAbortTimer(); // 开始计时
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                resetAbortTimer(); // 每收到数据重置（有流动不超时）
                 parser.feed(decoder.decode(value, { stream: true }));
             }
+            clearTimeout(abortTimer);
             parser.flush();
 
             // 流结束后移除打字光标
             const cursor = contentEl.querySelector(".typing-cursor");
             if (cursor) cursor.remove();
         } catch (err) {
-            contentEl.innerHTML = `<div class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(err.message)}</div>`;
-            statusHint.textContent = "出错";
+            clearTimeout(abortTimer);
+            if (err.name === "AbortError") {
+                contentEl.innerHTML += `<div class="text-muted small mt-2"><i class="bi bi-clock-history me-1"></i>已中断（超时或离开页面）</div>`;
+                statusHint.textContent = "已中断";
+            } else {
+                contentEl.innerHTML = `<div class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(err.message)}</div>`;
+                statusHint.textContent = "出错";
+            }
         } finally {
             streaming = false;
             setSending(false);
@@ -480,6 +498,15 @@
             questionInput.value = e.target.textContent;
             autoResize();
             questionInput.focus();
+        }
+    });
+
+    // 页面卸载提示：生成中切走会中断，提示用户确认
+    window.addEventListener("beforeunload", (e) => {
+        if (streaming) {
+            e.preventDefault();
+            e.returnValue = "";
+            window._chatAbortController?.abort();
         }
     });
 })();

@@ -56,6 +56,18 @@
         return window.API.escapeHtml(s || "");
     }
 
+    /** 上传成功后增量插入到列表顶部，不刷新全量（避免列表闪烁）*/
+    function insertDocToTop(doc) {
+        // 如果当前是空状态（"还没有文档"），清掉占位
+        const placeholder = tbody.querySelector(".text-center.text-muted");
+        if (placeholder) placeholder.closest("tr").remove();
+        // 插到最前面
+        tbody.insertAdjacentHTML("afterbegin", rowHtml(doc));
+        // 更新计数
+        const cnt = tbody.children.length;
+        listMeta.textContent = cnt ? `共加载 ${cnt} 条` : "";
+    }
+
     async function loadFirst() {
         tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted py-4">加载中...</td></tr>`;
         nextCursor = null;
@@ -116,6 +128,7 @@
     const uploadBox = document.getElementById("uploadProgress");
     const uploadFileName = document.getElementById("uploadFileName");
     const uploadStatus = document.getElementById("uploadStatus");
+    let currentXhr = null; // 保存上传 XHR 引用，beforeunload 时可中断
 
     dropZone.addEventListener("click", () => fileInput.click());
     ["dragover", "dragenter"].forEach((ev) =>
@@ -166,6 +179,7 @@
         fd.append("file", file);
 
         const xhr = new XMLHttpRequest();
+        currentXhr = xhr; // 保存引用供 beforeunload 中断
         xhr.open("POST", ENDPOINTS.documents.upload);
         xhr.timeout = 120000; // 120 秒超时（覆盖上传 + 解析 + 向量化）
         if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
@@ -196,7 +210,7 @@
                 uploadStatus.textContent = "完成";
                 uploadStatus.className = "text-success";
                 showToast("上传成功", "success");
-                loadFirst();
+                insertDocToTop(payload.data); // 增量插入顶部，不刷新全量
             } else if (xhr.status === 409 || payload.code === 20005) {
                 uploadStatus.textContent = "已存在";
                 uploadStatus.className = "text-warning";
@@ -225,4 +239,13 @@
 
         xhr.send(fd);
     }
+
+    // 页面卸载提示：上传中切走会中断，提示用户确认
+    window.addEventListener("beforeunload", (e) => {
+        if (currentXhr && currentXhr.readyState < 4) {
+            e.preventDefault();
+            e.returnValue = "";
+            currentXhr.abort();
+        }
+    });
 })();
