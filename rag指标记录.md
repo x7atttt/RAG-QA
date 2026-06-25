@@ -1,0 +1,81 @@
+# RAG 检索指标记录
+
+> 评测数据集：[qihoo360/InduOCRBench](https://huggingface.co/datasets/qihoo360/InduOCRBench)
+> 中文企业技术文档（12 行业 / 570 份 PDF / 2071 题），标注格式为 Hybrid Markdown（含 HTML 表格 + LaTeX）。
+>
+> 评测脚本：`tests/eval/run_eval.py`，原始结果：`tests/eval/eval_result.json`
+
+---
+
+## 评测一：Hybrid 检索（dense+sparse RRF）vs 纯 Dense
+
+**日期**：2026-06-25
+**样本**：50 题（从 2071 题中筛选"检索友好"题型，剔除对抗性/统计类）
+**灌库**：46 份文档 → 959 chunks（用 doc_md 标准标注直接灌库，排除 OCR 误差）
+**分块**：recursive 策略，chunk_size=500，overlap=100（与生产一致，含 `</table>` 保护）
+
+### 选题口径
+
+保留（检索可命中）：Basic Recognition / Structural Alignment / Cross-Field Continuity / Complex Reasoning
+剔除（需 LLM 推理，非检索能解决）：Statistical/Counting / 各种 *Attack / Aggregation
+
+### 结果
+
+| 方法 | Hit@1 | Hit@3 | Hit@5 | MRR |
+|------|:-----:|:-----:|:-----:|:---:|
+| dense（无 rerank） | 0.66 | 0.86 | 0.90 | 0.759 |
+| **hybrid（无 rerank）** | 0.66 | 0.84 | 0.86 | 0.751 |
+| dense + rerank | 0.78 | 0.94 | 0.96 | 0.857 |
+| **hybrid + rerank** | 0.78 | 0.94 | 0.96 | 0.857 |
+
+### 结论
+
+1. **sparse 在本数据集无提升，甚至略降（Hit@5: 0.90→0.86）**。诚实记录为负面结果。
+2. **reranker 是召回质量的关键**：把 Hit@3 从 0.86 拉到 0.94（+9.3%），贡献远大于 sparse 路。
+3. **reranker 抹平了召回顺序差异**：hybrid 改变了进 reranker 的候选顺序，但 cross-encoder 对候选独立打分，顺序不影响最终结果，故 hybrid+rerank 与 dense+rerank 完全一致。
+
+### 负面结果的技术分析
+
+为何 sparse 没发挥作用：
+
+- **数据集特性**：InduOCRBench 的题 90%+ 是表格精确查找（evidence 是 `<tr><td>` HTML 片段）。同一表格的 chunk 语义高度集中，dense 向量已能精确定位，sparse 的词项匹配反而是噪声——含相同词项但不同行的 chunk 会被提前。
+- **中文 tokenizer 局限**：BGE-M3 的 sparse 基于 XLM-RoBERTa 子词分词，中文一字多 token，词项匹配的精确度不如英文，sparse 信号弱。
+- **sparse 的真实价值场景**：英文为主、术语/缩写密集（如 "CIoU"、"BERT"、"RESTful"）的技术文档，或 reranker 缺席/候选量极大来不及全量的场景。本数据集（中文表格）不满足。
+
+### 对项目的启示
+
+- **保留 hybrid 代码但承认当前无实测收益**：sparse 路对英文术语场景仍有理论价值，代码已实现且经测试，但简历叙事需调整（不能声称"提升召回率"）。
+- **真正的提升点是 reranker**：Hit@3 从 0.86→0.94 是实测数据，简历应强调"两阶段检索（召回→rerank 精排）将 Top-3 命中率提升至 94%"。
+- **sparse 路记录为"已实现、待英文场景验证"**：诚实记录在项目不足里。
+
+---
+
+## 评测二：Reranker 价值（dense 召回 → rerank 精排）
+
+从上表提取的 reranker 单独贡献：
+
+| 指标 | dense 无 rerank | dense + rerank | 提升 |
+|------|:--------------:|:--------------:|:----:|
+| Hit@1 | 0.66 | 0.78 | +18.2% |
+| Hit@3 | 0.86 | 0.94 | +9.3% |
+| Hit@5 | 0.90 | 0.96 | +6.7% |
+| MRR | 0.759 | 0.857 | +12.9% |
+
+**结论**：BGE-Reranker-v2-M3 精排使 Top-3 命中率从 86% 提升至 94%，MRR 提升 12.9%。两阶段检索（召回 Top-20 → 精排 Top-3）是本项目检索质量的核心保障。
+
+---
+
+## 环境与复现
+
+```bash
+# 确保已下载 InduOCRBench 到项目根目录（仅 RAG_eval 部分）
+# huggingface-cli download qihoo360/InduOCRBench --repo-type dataset \
+#   --local-dir ./InduOCRBench --include "RAG_eval/*"
+
+# 运行评测（默认抽样 50 题）
+.venv/Scripts/python.exe tests/eval/run_eval.py --sample 50
+```
+
+- 评测用独立 Chroma 库（`data/chroma_eval/`），不污染生产数据
+- 命中判定：检索 chunk 去空白后是否包含 evidence 前 30 字符指纹
+- GPU 加速：BGE-M3/Reranker 走 CUDA（encode <1s/batch）

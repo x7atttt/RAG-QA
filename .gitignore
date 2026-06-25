@@ -56,3 +56,13 @@ wheels/
 # 临时测试脚本（_xxx.py，正式测试在 tests/）
 test.py
 /test/
+
+# 评测数据集（体积大，从 HuggingFace 按需下载）
+InduOCRBench/
+pdfQA-main/
+
+# 评测中间产物（eval_result.json 每次重跑会更新）
+tests/eval/eval_result.json
+
+# 评测用独立 Chroma 库
+data/chroma_eval/
