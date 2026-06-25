@@ -56,7 +56,7 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | **后端** | FastAPI · LangGraph · SQLAlchemy · Pydantic v2 |
 | **RAG** | ChromaDB · FlagEmbedding (bge-m3 / bge-reranker-v2-m3) |
 | **LLM** | langchain-deepseek（原生 reasoning_content 流式捕获）|
-| **解析** | pymupdf4llm（PDF 版面感知）· MarkItDown（DOCX，mammoth 底层）|
+| **解析** | MinerU 云 API（PDF: OCR/表格/公式/图片，失败回退 pymupdf4llm）· MarkItDown（DOCX）|
 | **分块** | langchain-text-splitters（MarkdownHeader / RecursiveCharacter）|
 | **缓存/限流** | Redis · slowapi |
 | **存储** | SQLite (aiosqlite) |
