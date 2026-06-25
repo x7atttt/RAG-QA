@@ -52,4 +52,7 @@ wheels/
 
 # Claude/zcode 配置
 .claude/
-test.py  
+
+# 临时测试脚本（_xxx.py，正式测试在 tests/）
+test.py
+/test/
