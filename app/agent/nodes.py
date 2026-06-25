@@ -4,7 +4,7 @@ from langchain_deepseek import ChatDeepSeek
 from app.agent.state import AgentState
 from app.config import get_settings
 from app.services.document_service import get_user_collection
-from app.services.embedding_service import encode_single
+from app.services.embedding_service import encode_query_full, encode_single, sparse_score
 from app.services.rerank_service import rerank
 
 settings = get_settings()
@@ -96,15 +96,49 @@ async def intent_router(state: AgentState) -> AgentState:
     return state
 
 
+def _rrf_fuse(
+    dense_rank: list[int], sparse_rank: list[int], k: int
+) -> list[int]:
+    """Reciprocal Rank Fusion：把 dense/sparse 两路的排名融合成统一候选序。
+
+    dense_rank[i] 表示候选 i 在 dense 路的排名（0=最相关）；
+    sparse_rank 同理。RRF 得分 = Σ 1/(k + rank)，得分越高越相关。
+    返回按 RRF 得分降序的候选下标列表。
+    """
+    scores: dict[int, float] = {}
+    for ranks in (dense_rank, sparse_rank):
+        for rank, idx in enumerate(ranks):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
+
+
 async def retrieve_documents(state: AgentState) -> AgentState:
+    """Hybrid 检索：dense（Chroma HNSW）+ sparse（BGE-M3 lexical_weights）RRF 融合。
+
+    流程（"dense 粗筛 → sparse 重排 → RRF 融合 → reranker 精排"）：
+      1. BGE-M3 同时编码 query 的 dense 向量与 sparse lexical_weights
+      2. dense 路：Chroma HNSW 召回 Top-N 候选（N=dense_recall_top_k=50）
+      3. sparse 路：对这批候选重新算 lexical 匹配得分，给 sparse 排名
+         （不遍历全库，只在 dense 候选集内重排，控制计算量）
+      4. RRF 融合两路排名 → 取 Top-K（retrieve_top_k=20）
+      5. BGE-Reranker 精排 → Top-3 喂生成
+
+    相比纯 dense：sparse 路对精确术语/关键词/缩写的强匹配能补救 dense 的语义漂移，
+    把"字面没对上但语义相关"和"字面正好对上"两类命中都纳入候选。
+    """
     question = state["question"]
     user_id = state["user_id"]
 
     collection = get_user_collection(user_id)
-    query_vec = await encode_single(question)
+
+    # 1. query 双编码：dense + sparse
+    query_enc = await encode_query_full(question)
+    query_vec = query_enc["dense"]
+    query_sparse = query_enc["sparse"]
 
     try:
-        results = collection.query(query_embeddings=[query_vec], n_results=settings.retrieve_top_k)
+        # 2. dense 路：HNSW 召回候选（扩大到 dense_recall_top_k）
+        results = collection.query(query_embeddings=[query_vec], n_results=settings.dense_recall_top_k)
     except Exception:
         state["retrieved_docs"] = []
         state["sources"] = []
@@ -117,19 +151,33 @@ async def retrieve_documents(state: AgentState) -> AgentState:
         state["sources"] = []
         return state
 
-    top_pairs = await rerank(question, candidates, top_k=settings.rerank_top_k)
+    # 3. sparse 路：对候选集算 lexical 匹配得分
+    sparse_scores = await sparse_score(query_sparse, candidates)
+    # dense 路的排名就是 Chroma 返回顺序（HNSW 已按相似度排好）
+    dense_rank = list(range(len(candidates)))
+    # sparse 路按得分降序排
+    sparse_rank = sorted(range(len(candidates)), key=lambda i: sparse_scores[i], reverse=True)
+
+    # 4. RRF 融合 → 取 Top-K（retrieve_top_k）
+    fused_order = _rrf_fuse(dense_rank, sparse_rank, settings.rrf_k)
+    top_idxs = fused_order[: settings.retrieve_top_k]
+    fused_candidates = [candidates[i] for i in top_idxs]
+    fused_metas = [metadatas[i] for i in top_idxs]
+
+    # 5. reranker 精排
+    top_pairs = await rerank(question, fused_candidates, top_k=settings.rerank_top_k)
 
     retrieved_docs: list[str] = []
     sources = []
     for orig_idx, score in top_pairs:
-        retrieved_docs.append(candidates[orig_idx])
-        meta = metadatas[orig_idx]
+        retrieved_docs.append(fused_candidates[orig_idx])
+        meta = fused_metas[orig_idx]
         sources.append(
             {
                 "document_id": meta.get("document_id"),
                 "filename": meta.get("filename", ""),
                 "chunk_index": meta.get("chunk_index", 0),
-                "content": candidates[orig_idx][:200],
+                "content": fused_candidates[orig_idx][:200],
                 "score": round(float(score), 4),
             }
         )

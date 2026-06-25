@@ -35,6 +35,12 @@ class Settings(BaseSettings):
 
     retrieve_top_k: int = 20
     rerank_top_k: int = 3
+    # Hybrid 检索（dense+sparse RRF 融合）参数
+    # dense 粗筛召回量：从 Chroma 取的候选数，需 > retrieve_top_k 以给 sparse 重排留余量
+    dense_recall_top_k: int = 50
+    # RRF（Reciprocal Rank Fusion）常数 k：score = Σ 1/(k + rank_i)，标准值 60
+    # k 越大，排名靠后的项衰减越慢（对各路更均衡）；k 越小，头部项权重越大
+    rrf_k: int = 60
     # 每用户最大会话数（超出拒绝创建，提示先删除旧会话）
     max_conversations: int = 10
 
