@@ -65,7 +65,9 @@ pdfQA-main/
 tests/eval/eval_result.json
 tests/eval/eval_result_ocr.json
 tests/eval/eval_result_ocr_llmjudge.json
+tests/eval/eval_result_ragas.json
 tests/eval/judge_cache.jsonl
+tests/eval/ragas_gen_cache.jsonl
 
 # 评测用独立 Chroma 库
 data/chroma_eval/

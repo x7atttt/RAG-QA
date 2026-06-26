@@ -12,9 +12,9 @@
 | 层次 | 测什么 | 链路范围 | 指标 | 是否含生成 |
 |------|--------|---------|------|:---:|
 | **检索层** | 检索到的 chunk 对不对 | query → 检索 → rerank → Top3 | Hit Rate / MRR | ❌ 不跑 LLM 生成 |
-| **端到端**（待补） | 最终生成的答案好不好 | query → 检索 → LLM生成 → 答案 | RAGAS（Faithfulness/Answer Relevancy/Context Recall） | ✅ 要跑生成 |
+| **端到端** | 最终生成的答案好不好 | query → 检索 → LLM生成 → 答案 | RAGAS（Faithfulness / Answer Relevancy） | ✅ 含生成 |
 
-> 严格意义的"端到端"必须包含生成层。本文件中标注为"端到端"的评测（评测四）实际只走到检索层，更准确的说法是"OCR→检索链路"。真正的端到端评测（含 RAGAS）待补。
+> 严格意义的"端到端"必须包含生成层。评测一二三四为检索层（评测四含 OCR 解析但未跑生成），评测五为真正的端到端（含 RAGAS）。
 
 ---
 
@@ -204,4 +204,70 @@ Query 改写**不能用 InduOCRBench 的 Hit/MRR 指标评测**，因为：
 # LLM judge 结果缓存在 tests/eval/judge_cache.jsonl（重跑免再调 API）
 
 .venv/Scripts/python.exe tests/eval/run_eval_ocr_llmjudge.py --sample 50
+```
+
+---
+
+## 评测五：RAGAS 端到端（生成层）
+
+**日期**：2026-06-26
+**脚本**：`tests/eval/run_eval_ragas.py`
+**层次**：端到端（OCR→检索→LLM生成→答案），含完整生成层
+**灌库口径**：OCR 口径（复用 `data/chroma_eval_ocr`，626 chunks，MinerU 解析结果），与评测四可比
+
+### 指标
+
+| 指标 | 含义 | 判定方式 |
+|------|------|---------|
+| **Faithfulness** | 答案有没有幻觉（是否忠实于检索内容） | LLM judge：把答案拆成陈述句，逐句核对能否从 retrieved_contexts 推出 |
+| **Answer Relevancy** | 答案切不切题 | LLM 从答案反生成问题，算与原问题的 embedding 相似度 |
+
+### RAGAS judge 配置
+
+- **LLM judge**：`LangchainLLMWrapper(ChatOpenAI(model=deepseek-v4-flash, base_url=api.deepseek.com, temperature=0))`
+- **Embedding**：本地 BGE-M3（包成 LangChain Embeddings，复用项目 `app/services/embedding_service.py`）
+- **AnswerRelevancy strictness=1**：默认 strictness=3 会用 n=3 多采样生成反推问题，DeepSeek 不支持 n>1，必须降为 1
+
+### 数据流（每题）
+
+```
+1. retrieved_contexts = retrieve_top5(col, question)         ← 复用 dense+rerank
+2. messages = _build_rag_prompt(question, retrieved_contexts) ← 生产严格 RAG prompt
+3. response = await chat(messages, thinking=False)           ← 生成答案（temperature=0）
+4. SingleTurnSample(user_input, response, retrieved_contexts, reference=answer)
+5. ragas.evaluate(metrics=[Faithfulness, AnswerRelevancy], llm=judge, embeddings=BGE-M3)
+```
+
+### 结果（48 题，OCR 口径）
+
+| 指标 | 分数 | 含义 |
+|------|:----:|------|
+| **Faithfulness** | **0.78** | 78% 的答案忠实于检索内容（无幻觉） |
+| **Answer Relevancy** | **0.64** | 答案切题度 64% |
+
+### 分析
+
+1. **Faithfulness 0.78**：多数答案忠实于检索内容。faith=0 的题主要是检索失败（如英文论文跨库串、OCR 遗漏关键信息），LLM 无中生有被判幻觉。检索正确的题 faith 普遍为 1.0。
+2. **Answer Relevancy 0.64**：低于 Faithfulness。部分答案虽无幻觉但不够切题——检索到的内容不能完整回答问题（如问"发布时间"但 OCR 漏了日期），LLM 只能部分回答。
+3. **Faithfulness > Answer Relevancy（0.78 > 0.64）的解读**：系统"不胡说"的能力（78%）强于"答得全"的能力（64%）。短板在检索召回质量（OCR 损耗），而非生成质量——这与评测四（OCR→检索 71%）的结论一致。
+
+### 与检索层指标的对应关系
+
+| 层次 | 指标 | 结果 | 关系 |
+|------|------|:----:|------|
+| 检索层（标准标注）| Hit@3 | 94% | 检索能力上限 |
+| 检索层（OCR→检索）| Hit@3 | 71% | OCR 损耗后 |
+| **生成层（RAGAS）** | Faithfulness | **78%** | 答案忠实度（含生成损耗）|
+| **生成层（RAGAS）** | Answer Relevancy | **64%** | 答案切题度 |
+
+Faithfulness（78%）介于检索层 OCR 口径（71%）和标准标注（94%）之间，合理——检索到正确内容 + LLM 忠实生成 = 78%。Answer Relevancy（64%）低于 Faithfulness，说明"检索到了但答不全"是另一层损耗。
+
+### 环境与复现
+
+```bash
+# 复用 OCR 库 data/chroma_eval_ocr + MinerU 缓存 data/ocr_md_cache
+# 生成答案缓存 tests/eval/ragas_gen_cache.jsonl（重跑免再调生成 LLM）
+# RAGAS judge 每次实时调（无缓存，因 strictness/温度可能影响结果）
+
+.venv/Scripts/python.exe tests/eval/run_eval_ragas.py --sample 50
 ```
