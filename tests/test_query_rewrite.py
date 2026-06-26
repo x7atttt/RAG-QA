@@ -34,15 +34,12 @@ async def test_rewrite_with_history_resolves_coreference():
     ]
     state = _make_state("第三条是什么？", history)
 
-    # mock LLM：返回改写后的问题
-    mock_llm = AsyncMock()
-    mock_llm.ainvoke = AsyncMock(return_value=type("R", (), {"content": "文档里第3条规则的具体内容是什么？"})())
-    with patch("app.agent.nodes.get_llm", return_value=mock_llm):
+    # mock nodes 里已 import 的 chat 引用（from import 绑定到 nodes 命名空间）
+    with patch("app.agent.nodes.chat", new_callable=AsyncMock, return_value="文档里第3条规则的具体内容是什么？"):
         result = await rewrite_query(state)
 
     assert result["rewritten_query"] == "文档里第3条规则的具体内容是什么？"
     assert result["question"] == "第三条是什么？"  # 原始问题不变
-    assert mock_llm.ainvoke.called  # 确实调了 LLM
 
 
 @pytest.mark.asyncio
@@ -50,12 +47,11 @@ async def test_rewrite_empty_history_skips_llm_call():
     """空历史时不调 LLM（省一次调用），rewritten_query == question。"""
     state = _make_state("文档里的规则有哪些？", history=[])
 
-    mock_llm = AsyncMock()
-    with patch("app.agent.nodes.get_llm", return_value=mock_llm):
+    with patch("app.agent.nodes.chat", new_callable=AsyncMock) as mock_chat:
         result = await rewrite_query(state)
 
     assert result["rewritten_query"] == "文档里的规则有哪些？"
-    assert not mock_llm.ainvoke.called  # 没调 LLM
+    assert not mock_chat.called  # 没调 LLM
 
 
 @pytest.mark.asyncio
@@ -64,9 +60,7 @@ async def test_rewrite_llm_exception_falls_back_to_question():
     history = [{"role": "user", "content": "上一轮问题"}]
     state = _make_state("它是什么？", history)
 
-    mock_llm = AsyncMock()
-    mock_llm.ainvoke = AsyncMock(side_effect=Exception("API 超时"))
-    with patch("app.agent.nodes.get_llm", return_value=mock_llm):
+    with patch("app.agent.nodes.chat", new_callable=AsyncMock, side_effect=Exception("API 超时")):
         result = await rewrite_query(state)
 
     # 降级：用原始问题，不抛异常
@@ -79,11 +73,8 @@ async def test_rewrite_strips_quotes_and_punctuation():
     history = [{"role": "user", "content": "刚才提到的加密"}]
     state = _make_state("具体说说", history)
 
-    # LLM 返回带首尾引号和句号
-    fake_resp = type("R", (), {"content": "\u201c加密的具体实现方式\u201d。"})()
-    mock_llm = AsyncMock()
-    mock_llm.ainvoke = AsyncMock(return_value=fake_resp)
-    with patch("app.agent.nodes.get_llm", return_value=mock_llm):
+    # LLM 返回带首尾引号和句号（含中文弯引号）
+    with patch("app.agent.nodes.chat", new_callable=AsyncMock, return_value="\u201c加密的具体实现方式\u201d。"):
         result = await rewrite_query(state)
 
     assert result["rewritten_query"] == "加密的具体实现方式"

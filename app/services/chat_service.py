@@ -2,8 +2,6 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from langgraph.graph.state import CompiledStateGraph
-
 from app.agent.state import AgentState
 
 
@@ -12,35 +10,14 @@ def sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-def _extract_reasoning(chunk: Any) -> str:
-    """从流式 chunk 中提取推理增量。
-
-    langchain-deepseek 把 reasoning_content 解析到
-    chunk.additional_kwargs['reasoning_content']（见 ChatDeepSeek 源码）。
-    这里做兼容性兜底。
-    """
-    aw = getattr(chunk, "additional_kwargs", None) or {}
-    if isinstance(aw, dict):
-        rc = aw.get("reasoning_content")
-        if isinstance(rc, str) and rc:
-            return rc
-    rc = getattr(chunk, "reasoning_content", None)
-    if isinstance(rc, str) and rc:
-        return rc
-    rm = getattr(chunk, "response_metadata", None) or {}
-    if isinstance(rm, dict):
-        rc = rm.get("reasoning_content")
-        if isinstance(rc, str) and rc:
-            return rc
-    return ""
-
-
-# 哪些节点的 LLM 流才算"正式输出"（intent_router 的 yes/no 不算）
-_ANSWER_NODES = {"generate_answer", "general_answer"}
+# 手动编排节点执行（替代原 graph.astream_events 方案）：
+# 原 LangChain ChatDeepSeek 的 on_chat_model_stream 事件在改用 OpenAI SDK 后不再触发，
+# 故改为 stream_graph 直接调用节点函数，在生成阶段用 astream_chat 实时 yield token/reasoning。
+# 这样流式推送完全可控，thinking 模式的 reasoning_content 能正确推送到前端。
 
 
 async def stream_graph(
-    graph: CompiledStateGraph,
+    graph,
     user_id: int,
     question: str,
     history: list[dict] | None = None,
@@ -48,12 +25,28 @@ async def stream_graph(
 ) -> AsyncIterator[tuple[str, Any]]:
     """yield (event_name, payload). event ∈ reasoning/token/sources/done/error.
 
-    统一走 graph.astream_events：
-    - 通过 on_chain_start/end 追踪当前节点，只放行 generate_answer/general_answer
-      的 LLM 流式 token，过滤掉 intent_router 的 yes/no 判断
-    - thinking 开启时，ChatDeepSeek 的推理内容出现在 chunk.additional_kwargs，
-      通过 reasoning 事件单独推送（在 token 之前）
+    手动编排（不走 graph.astream_events）：
+    1. intent_router → 判断要不要检索
+    2. retrieve_documents（含 rewrite_query）→ 推 sources
+    3. generate_answer/general_answer → astream_chat 流式 yield token/reasoning
+
+    放弃 LangGraph 的 astream_events：它依赖 LangChain 的 on_chat_model_stream 事件，
+    改用 OpenAI SDK 直连后该事件不触发。手动编排让生成阶段的流式完全可控，
+    thinking 模式的 reasoning_content 实时推送，让前端"深度思考"开关真正生效。
     """
+    # 延迟导入避免循环依赖（nodes 依赖 llm_provider，不依赖本模块）
+    from app.agent.nodes import (
+        _build_fallback_prompt,
+        _build_rag_prompt,
+        _history_to_messages,
+        general_answer,
+        generate_answer,
+        intent_router,
+        retrieve_documents,
+    )
+    from app.services.llm_provider import astream_chat
+    from langchain_core.messages import HumanMessage
+
     initial: AgentState = {
         "user_id": user_id,
         "question": question,
@@ -73,53 +66,54 @@ async def stream_graph(
 
     answer_parts: list[str] = []
     reasoning_parts: list[str] = []
-    sources_emitted = False
-    # 追踪当前所在节点栈（langgraph 节点名，非 LLM 类名）
-    current_chain: list[str] = []
 
     try:
-        async for evt in graph.astream_events(initial, version="v2"):
-            kind = evt.get("event")
-            name = evt.get("name", "")
+        state = initial
+        # 1. 意图路由
+        state = await intent_router(state)
 
-            # 维护当前节点栈
-            if kind == "on_chain_start" and name:
-                current_chain.append(name)
-            elif kind == "on_chain_end" and name and current_chain:
-                if name in current_chain:
-                    idx = len(current_chain) - 1 - current_chain[::-1].index(name)
-                    current_chain = current_chain[:idx]
+        if state.get("should_retrieve"):
+            # 2. 检索（含 query 改写，retrieve_documents 内部先跑 rewrite）
+            # 注：retrieve_documents 依赖 rewritten_query，由 rewrite_query 节点填充。
+            # 这里手动补一步 rewrite，再 retrieve（与 graph 编排一致）
+            from app.agent.nodes import rewrite_query
 
-            # 检索完成 → 推送来源
-            if kind == "on_chain_end" and name == "retrieve_documents":
-                output = evt.get("data", {}).get("output")
-                if isinstance(output, dict) and output.get("sources") and not sources_emitted:
-                    sources_emitted = True
-                    yield ("sources", output["sources"])
+            state = await rewrite_query(state)
+            state = await retrieve_documents(state)
+            # 推送来源
+            if state.get("sources"):
+                yield ("sources", state["sources"])
+        else:
+            state["retrieved_docs"] = []
+            state["sources"] = []
 
-            # LLM 流式 token —— 只接受答案节点
-            elif kind == "on_chat_model_stream":
-                if not any(n in _ANSWER_NODES for n in current_chain):
-                    continue
-                chunk = evt.get("data", {}).get("chunk")
-                if chunk is None:
-                    continue
+        # 3. 构造生成消息
+        question_text = state["question"]
+        history_list = state.get("history", [])
+        if state.get("should_retrieve"):
+            docs = state.get("retrieved_docs", [])
+            sources = state.get("sources", [])
+            top_score = sources[0].get("score", 0) if sources else 0
+            if docs and top_score >= 0.5:
+                messages = _build_rag_prompt(question_text, docs, history_list)
+            else:
+                messages = _build_fallback_prompt(question_text, docs, history_list)
+        else:
+            # 纯对话（general_answer 路径）
+            messages = _history_to_messages(history_list)
+            messages.append(HumanMessage(content=question_text))
 
-                # 推理内容（reasoning_content）—— 单独事件，在 token 之前
-                rc = _extract_reasoning(chunk)
-                if rc:
-                    reasoning_parts.append(rc)
-                    yield ("reasoning", rc)
+        # 4. 流式生成：直接用 OpenAI SDK 的 astream_chat，实时 yield
+        async for event, text in astream_chat(messages, thinking=thinking):
+            if event == "reasoning":
+                reasoning_parts.append(text)
+                yield ("reasoning", text)
+            elif event == "content":
+                answer_parts.append(text)
+                yield ("token", text)
 
-                # 正式答案
-                content = getattr(chunk, "content", None)
-                if isinstance(content, str) and content:
-                    answer_parts.append(content)
-                    yield ("token", content)
-
-        answer = "".join(answer_parts)
         yield ("answer_final", {
-            "answer": answer,
+            "answer": "".join(answer_parts),
             "reasoning": "".join(reasoning_parts),
         })
         yield ("done", {"status": "ok"})

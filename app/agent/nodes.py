@@ -1,64 +1,16 @@
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_deepseek import ChatDeepSeek
 
 from app.agent.state import AgentState
 from app.config import get_settings
 from app.services.document_service import get_user_collection
 from app.services.embedding_service import encode_query_full, encode_single, sparse_score
+from app.services.llm_provider import astream_chat, chat
 from app.services.rerank_service import rerank
 
 settings = get_settings()
 
 # 最近 N 轮历史作为上下文传给 LLM（每轮 = user + assistant 两条消息）
 MAX_HISTORY_ROUNDS = 5
-
-_llm: ChatDeepSeek | None = None          # intent_router 用（非流式，无 thinking）
-_llm_stream: ChatDeepSeek | None = None   # 流式，无 thinking
-_llm_stream_thinking: ChatDeepSeek | None = None  # 流式，开启 thinking
-
-
-def _make_llm(streaming: bool, thinking: bool) -> ChatDeepSeek:
-    """构造 ChatDeepSeek。thinking=True 时透传 DeepSeek 的 thinking 开关。
-
-    用 langchain-deepseek 而非 langchain-openai：前者原生解析 reasoning_content
-    到 chunk.additional_kwargs['reasoning_content']，支持 thinking 流式推理捕获。
-    """
-    kwargs = dict(
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        base_url=settings.llm_base_url,  # 保持可配置（兼容自定义 endpoint）
-    )
-    if streaming:
-        kwargs["streaming"] = True
-        kwargs["max_tokens"] = 1024
-    else:
-        kwargs["max_tokens"] = 512
-    if thinking:
-        # DeepSeek 思考模式：通过 extra_body 透传
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-    return ChatDeepSeek(**kwargs)
-
-
-def get_llm(streaming: bool = False, thinking: bool = False) -> ChatDeepSeek:
-    """获取 LLM 实例（带缓存）。
-
-    - intent_router 用 streaming=False, thinking=False
-    - 答案生成用 streaming=True，thinking 由用户请求决定
-    """
-    global _llm, _llm_stream, _llm_stream_thinking
-    if not streaming and not thinking:
-        if _llm is None:
-            _llm = _make_llm(streaming=False, thinking=False)
-        return _llm
-    if streaming and not thinking:
-        if _llm_stream is None:
-            _llm_stream = _make_llm(streaming=True, thinking=False)
-        return _llm_stream
-    if streaming and thinking:
-        if _llm_stream_thinking is None:
-            _llm_stream_thinking = _make_llm(streaming=True, thinking=True)
-        return _llm_stream_thinking
-    return _make_llm(streaming=False, thinking=True)
 
 
 async def intent_router(state: AgentState) -> AgentState:
@@ -76,7 +28,6 @@ async def intent_router(state: AgentState) -> AgentState:
         return state
 
     try:
-        llm = get_llm()
         messages = [
             SystemMessage(
                 content=(
@@ -89,8 +40,8 @@ async def intent_router(state: AgentState) -> AgentState:
             ),
             HumanMessage(content=f"问题：{question}"),
         ]
-        resp = await llm.ainvoke(messages)
-        state["should_retrieve"] = "yes" in resp.content.strip().lower()
+        resp = await chat(messages)
+        state["should_retrieve"] = "yes" in resp.strip().lower()
     except Exception:
         state["should_retrieve"] = True
     return state
@@ -118,7 +69,6 @@ async def rewrite_query(state: AgentState) -> AgentState:
         return state
 
     try:
-        llm = get_llm()
         # 把历史拼成对话格式（最多最近 3 轮，够消解指代又省 token）
         recent = history[-6:]  # 3 轮 = 6 条消息
         dialogue = "\n".join(
@@ -139,10 +89,10 @@ async def rewrite_query(state: AgentState) -> AgentState:
             ),
             HumanMessage(content=f"对话历史：\n{dialogue}\n\n最新问题：{question}\n\n改写后："),
         ]
-        resp = await llm.ainvoke(messages)
+        resp = await chat(messages)
         # 去除首尾可能的多余引号/句号（LLM 有时会用引号包裹改写结果）
         # 含中文弯引号 “ ” ‘ ’
-        rewritten = resp.content.strip().strip("\"'“”‘’。")
+        rewritten = resp.strip().strip("\"'“”‘’。")
         state["rewritten_query"] = rewritten or question
     except Exception:
         # 改写失败不阻断检索，降级用原始问题
@@ -316,15 +266,11 @@ async def generate_answer(state: AgentState) -> AgentState:
     else:
         messages = _build_fallback_prompt(question, docs, history)
 
-    # ChatDeepSeek 原生支持 reasoning_content，thinking 模式下流式 reasoning 会
-    # 出现在 chunk.additional_kwargs['reasoning_content']，由 chat_service 捕获
-    llm = get_llm(streaming=True, thinking=thinking)
-
+    # 流式生成：thinking 模式下 reasoning_content 先于 content 返回（由 chat_service 捕获）
     tokens: list[str] = []
-    async for chunk in llm.astream(messages):
-        content = chunk.content
-        if isinstance(content, str) and content:
-            tokens.append(content)
+    async for event, text in astream_chat(messages, thinking=thinking):
+        if event == "content":
+            tokens.append(text)
 
     state["answer_tokens"] = tokens
     state["answer"] = "".join(tokens)
@@ -336,15 +282,13 @@ async def general_answer(state: AgentState) -> AgentState:
     history = state.get("history", [])
     thinking = bool(state.get("thinking", False))
 
-    llm = get_llm(streaming=True, thinking=thinking)
     messages = _history_to_messages(history)
     messages.append(HumanMessage(content=question))
 
     tokens: list[str] = []
-    async for chunk in llm.astream(messages):
-        content = chunk.content
-        if isinstance(content, str) and content:
-            tokens.append(content)
+    async for event, text in astream_chat(messages, thinking=thinking):
+        if event == "content":
+            tokens.append(text)
 
     state["answer_tokens"] = tokens
     state["answer"] = "".join(tokens)
