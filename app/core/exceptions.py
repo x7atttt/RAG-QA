@@ -1,4 +1,5 @@
 import os
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -12,10 +13,11 @@ _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 
 
 class BizError(Exception):
-    def __init__(self, code: int, message: str, http_status: int = 400):
+    def __init__(self, code: int, message: str, http_status: int = 400, data: Any = None):
         self.code = code
         self.message = message
         self.http_status = http_status
+        self.data = data
         super().__init__(message)
 
 
@@ -34,7 +36,10 @@ def _wants_html(request: Request) -> bool:
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(BizError)
     async def _biz_error_handler(_: Request, exc: BizError) -> JSONResponse:
-        return JSONResponse(status_code=exc.http_status, content=error_response(exc.code, exc.message))
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"code": exc.code, "message": exc.message, "data": exc.data},
+        )
 
     @app.exception_handler(AuthError)
     async def _auth_error_handler(_: Request, exc: AuthError) -> JSONResponse:

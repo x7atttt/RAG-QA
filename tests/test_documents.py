@@ -119,3 +119,119 @@ async def test_cursor_pagination(client):
     data2 = resp2.json()["data"]
     assert len(data2["documents"]) == 2
     assert data2["documents"][0]["id"] < data["documents"][-1]["id"]
+
+
+# ---------- 同名上传确认测试（增量更新）----------
+
+
+@pytest.mark.asyncio
+async def test_upload_same_name_same_content_rejected(client):
+    """同名 + 同内容 → 拒绝（DOC_ALREADY_EXISTS，防重复）"""
+    token = await _register_and_login(client)
+    content = "# 原始文档\n\n" + "内容内容 " * 100
+    files = {"file": ("dup.md", io.BytesIO(content.encode("utf-8")), "text/markdown")}
+
+    resp1 = await client.post("/api/documents/upload", headers=_auth_header(token), files=files)
+    assert resp1.status_code == 200
+
+    # 第二次完全相同 → 409 DOC_ALREADY_EXISTS (20005)
+    files2 = {"file": ("dup.md", io.BytesIO(content.encode("utf-8")), "text/markdown")}
+    resp2 = await client.post("/api/documents/upload", headers=_auth_header(token), files=files2)
+    assert resp2.status_code == 409
+    assert resp2.json()["code"] == 20005
+
+
+@pytest.mark.asyncio
+async def test_upload_same_name_diff_content_returns_conflict(client):
+    """同名 + 不同内容（不带 replace_id）→ 409 DOC_SAME_NAME_CONFLICT，返回旧文档 id"""
+    token = await _register_and_login(client)
+
+    content_v1 = "# 版本一\n\n这是原始内容。" * 50
+    resp1 = await client.post(
+        "/api/documents/upload",
+        headers=_auth_header(token),
+        files={"file": ("conflict.md", io.BytesIO(content_v1.encode("utf-8")), "text/markdown")},
+    )
+    assert resp1.status_code == 200
+    old_id = resp1.json()["data"]["id"]
+
+    # 同名不同内容 → 冲突（20006），带 existing_id
+    content_v2 = "# 版本二\n\n内容完全不同了。" * 50
+    resp2 = await client.post(
+        "/api/documents/upload",
+        headers=_auth_header(token),
+        files={"file": ("conflict.md", io.BytesIO(content_v2.encode("utf-8")), "text/markdown")},
+    )
+    assert resp2.status_code == 409
+    body = resp2.json()
+    assert body["code"] == 20006  # DOC_SAME_NAME_CONFLICT
+    assert body["data"]["existing_id"] == old_id  # 返回旧文档 id 供前端确认
+    assert body["data"]["filename"] == "conflict.md"
+
+    # 旧文档仍在（未删除，等用户确认）
+    list_resp = await client.get("/api/documents/list", headers=_auth_header(token))
+    assert len(list_resp.json()["data"]["documents"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_with_replace_id_updates(client):
+    """带 replace_id → 用户已确认更新，删旧 + 新建成功"""
+    token = await _register_and_login(client)
+
+    content_v1 = "# 版本一\n\n原始内容。" * 50
+    resp1 = await client.post(
+        "/api/documents/upload",
+        headers=_auth_header(token),
+        files={"file": ("updatable.md", io.BytesIO(content_v1.encode("utf-8")), "text/markdown")},
+    )
+    old_id = resp1.json()["data"]["id"]
+
+    # 带 replace_id 上传 v2（模拟用户点了"更新"）
+    content_v2 = "# 版本二\n\n全新内容。" * 50
+    resp2 = await client.post(
+        f"/api/documents/upload?replace_id={old_id}",
+        headers=_auth_header(token),
+        files={"file": ("updatable.md", io.BytesIO(content_v2.encode("utf-8")), "text/markdown")},
+    )
+    assert resp2.status_code == 200, resp2.text
+    new_doc = resp2.json()["data"]
+
+    # 列表里只有 1 个同名文档（旧的被删，新建的入库）
+    list_resp = await client.get("/api/documents/list", headers=_auth_header(token))
+    docs = [d for d in list_resp.json()["data"]["documents"] if d["filename"] == "updatable.md"]
+    assert len(docs) == 1
+    # 新文档的 chunk_count > 0（确实重新解析入库了，不是空壳）
+    assert new_doc["chunk_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_upload_replace_id_not_found(client):
+    """replace_id 指向不存在的文档 → 404"""
+    token = await _register_and_login(client)
+    content = "# 文档\n\n内容 " * 50
+    resp = await client.post(
+        "/api/documents/upload?replace_id=99999",
+        headers=_auth_header(token),
+        files={"file": ("x.md", io.BytesIO(content.encode("utf-8")), "text/markdown")},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_diff_name_creates_new(client):
+    """不同名 → 正常新建（用不同内容，避免撞 hash）"""
+    token = await _register_and_login(client)
+
+    await client.post(
+        "/api/documents/upload",
+        headers=_auth_header(token),
+        files={"file": ("a.md", io.BytesIO(("# 文档A\n\n" + "A" * 200).encode("utf-8")), "text/markdown")},
+    )
+    await client.post(
+        "/api/documents/upload",
+        headers=_auth_header(token),
+        files={"file": ("b.md", io.BytesIO(("# 文档B\n\n" + "B" * 200).encode("utf-8")), "text/markdown")},
+    )
+
+    list_resp = await client.get("/api/documents/list", headers=_auth_header(token))
+    assert len(list_resp.json()["data"]["documents"]) == 2

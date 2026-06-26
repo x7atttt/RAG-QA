@@ -23,6 +23,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 @router.post("/upload")
 async def upload(
     file: UploadFile = File(...),
+    replace_id: int | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -58,6 +59,36 @@ async def upload(
             message="该文档已上传过，无需重复上传",
             http_status=409,
         )
+
+    # 增量更新：用户在前端确认"更新同名文档"后，带 replace_id 重传
+    # replace_id 指定要替换的旧文档，删旧 + 新建（用户显式声明，不靠文件名猜）
+    if replace_id is not None:
+        old_doc = await db.execute(
+            select(Document).where(Document.id == replace_id, Document.user_id == user.id)
+        )
+        old = old_doc.scalar_one_or_none()
+        if old is None:
+            raise BizError(code=ResponseCode.DOC_NOT_FOUND, message="待更新的文档不存在", http_status=404)
+        # 删旧 chunk + 旧记录，然后正常入库（Document.id 会变，历史 source 是 JSON 快照不受影响）
+        await delete_document(old, db)
+    else:
+        # 同名检测：无 replace_id 时，若同名文档存在且内容不同 → 返回冲突，等用户确认
+        # （同名≠同文档，不自动覆盖；让用户显式确认，避免误伤同名不同文档）
+        same_name = await db.execute(
+            select(Document).where(
+                Document.user_id == user.id,
+                Document.filename == file.filename,
+            )
+        )
+        same_doc = same_name.scalar_one_or_none()
+        if same_doc is not None:
+            # 能走到这里说明 hash 不同（上面已拦截相同 hash），即内容变了
+            raise BizError(
+                code=ResponseCode.DOC_SAME_NAME_CONFLICT,
+                message=f"已存在同名文档「{file.filename}」，是否更新为最新版本？",
+                http_status=409,
+                data={"existing_id": same_doc.id, "filename": same_doc.filename},
+            )
 
     file_path, _ = save_upload_file(content, ext)
     try:

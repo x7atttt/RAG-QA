@@ -154,7 +154,7 @@
 
     const uploadBar = document.getElementById("uploadBar");
 
-    function uploadFile(file) {
+    function uploadFile(file, replaceId = null) {
         // 前端预校验
         const ext = file.name.split(".").pop().toLowerCase();
         if (!["pdf", "docx", "md"].includes(ext)) {
@@ -180,7 +180,11 @@
 
         const xhr = new XMLHttpRequest();
         currentXhr = xhr; // 保存引用供 beforeunload 中断
-        xhr.open("POST", ENDPOINTS.documents.upload);
+        // 带 replace_id 时拼到 query（用户已确认更新同名文档）
+        const url = replaceId
+            ? `${ENDPOINTS.documents.upload}?replace_id=${replaceId}`
+            : ENDPOINTS.documents.upload;
+        xhr.open("POST", url);
         xhr.timeout = 120000; // 120 秒超时（覆盖上传 + 解析 + 向量化）
         if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
 
@@ -209,12 +213,23 @@
             if (xhr.status === 200 && payload.code === 0) {
                 uploadStatus.textContent = "完成";
                 uploadStatus.className = "text-success";
-                showToast("上传成功", "success");
+                showToast(replaceId ? "文档已更新" : "上传成功", "success");
+                // 更新场景：旧文档已删，先移除旧行再插入新行到顶部
+                if (replaceId) {
+                    const oldRow = tbody.querySelector(`tr[data-id="${replaceId}"]`);
+                    if (oldRow) oldRow.remove();
+                }
                 insertDocToTop(payload.data); // 增量插入顶部，不刷新全量
-            } else if (xhr.status === 409 || payload.code === 20005) {
+            } else if (payload.code === 20005) {
+                // 完全重复（hash 相同）→ 直接提示，不弹窗
                 uploadStatus.textContent = "已存在";
                 uploadStatus.className = "text-warning";
                 showToast("该文档已上传过，无需重复上传", "warning");
+            } else if (payload.code === 20006) {
+                // 同名但内容不同 → 弹窗让用户确认是否更新
+                uploadStatus.textContent = "待确认";
+                uploadStatus.className = "text-warning";
+                showUpdateConfirm(file, payload.data.existing_id, payload.data.filename);
             } else {
                 uploadStatus.textContent = "失败";
                 uploadStatus.className = "text-danger";
@@ -239,6 +254,28 @@
 
         xhr.send(fd);
     }
+
+    // ---------- 同名文档更新确认 ----------
+    const updateModal = new bootstrap.Modal(document.getElementById("updateConfirmModal"));
+    let pendingFile = null;   // 等待用户确认的文件
+    let pendingReplaceId = null; // 确认后要替换的旧文档 id
+
+    function showUpdateConfirm(file, existingId, filename) {
+        pendingFile = file;
+        pendingReplaceId = existingId;
+        document.getElementById("conflictFilename").textContent = filename;
+        updateModal.show();
+    }
+
+    // 用户点"更新"→ 带 replace_id 重新上传
+    document.getElementById("confirmUpdateBtn").addEventListener("click", () => {
+        updateModal.hide();
+        if (pendingFile && pendingReplaceId) {
+            uploadFile(pendingFile, pendingReplaceId);
+            pendingFile = null;
+            pendingReplaceId = null;
+        }
+    });
 
     // 页面卸载提示：上传中切走会中断，提示用户确认
     window.addEventListener("beforeunload", (e) => {
