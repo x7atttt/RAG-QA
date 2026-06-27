@@ -32,7 +32,8 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | 特性 | 说明 |
 |------|------|
 | 📄 **多格式文档** | 支持 PDF / DOCX / Markdown。PDF 走 MinerU 高精度解析（OCR/表格/公式/图片提取，失败回退 pymupdf4llm），DOCX 走 MarkItDown，自动分块、Embedding 入库 |
-| 🧩 **多策略分块** | auto 按文件类型路由（md→markdown，pdf/docx→recursive），可选 fixed/markdown/recursive |
+| 📦 **批量上传** | 多文件选择 + 后端异步处理（BackgroundTasks）+ 状态轮询（pending→done），MinerU 并发限流（Semaphore）防云 API 限流 |
+| 🧩 **多策略分块** | auto 按文件类型路由（md→markdown，pdf→html_preserve 保护表格，docx→recursive），HTMLSemanticPreservingSplitter 硬保 PDF 超大表格不被切 |
 | 🔍 **RAG 检索增强** | BGE-M3 向量检索（dense+sparse RRF 混合召回）+ BGE-Reranker-v2-M3 交叉编码器精排 |
 | 🤖 **LangGraph Agent** | 状态图编排"意图判断 → query 改写 → 检索 → 生成"链路，意图路由按需检索 |
 | 💬 **多会话管理** | 侧边栏会话列表，新建/切换/删除，每用户上限 10 个，首问自动生成标题 |
@@ -40,11 +41,11 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | ⚡ **SSE 流式输出** | Server-Sent Events 实时打字机效果，推理面板自动展开、答案逐字呈现 |
 | 🧠 **智能降级回答** | 检索低相关/无命中时降级为「文档背景 + 常识」回答，泛化问题（如「怎么改进简历」）不再硬拒绝 |
 | 🔁 **多轮上下文 + query 改写** | 保留会话最近 5 轮历史，检索前 LLM 改写指代词（"它""第三条"→ 完整问题），解决多轮指代检索失效 |
+| 🔄 **同名文档更新** | 上传同名文档时弹窗确认（replace_id 显式声明），避免误伤同名不同文档 |
 | 🚀 **GPU 加速** | 自动检测 CUDA，BGE-M3/Reranker 在 GPU 上推理（encode 17 chunks：21.5s → 0.2s）|
 | 🔐 **JWT 认证** | 注册/登录、数据按用户隔离 |
-| 🚀 **多级缓存 + 限流** | Redis 缓存（按会话+thinking 模式分桶隔离，含空值防穿透）+ slowapi 令牌桶限流 |
-| 🚫 **内容去重** | sha256 文件指纹，用户内去重，重复上传直接拒绝（省 embedding 算力）|
-| 📊 **上传进度** | XMLHttpRequest 真实进度条 + 超时处理 + 重复文档友好提示 |
+| 🚀 **Redis 缓存防护 + 限流** | 防穿透（空值缓存）/ 防击穿（SETNX 互斥锁）/ 防雪崩（TTL ±20% 抖动）+ slowapi 令牌桶限流（100/分钟/用户）|
+| 🚫 **幂等上传** | sha256 文件哈希查重 + 数据库 `(user_id, file_hash)` 唯一约束兜底，防重复提交 |
 | 📃 **游标分页** | 文档列表与对话历史均用 cursor 分页，无深分页性能问题 |
 
 ---
@@ -84,8 +85,9 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 │   └── services/            # 业务层：文档/Embedding/Rerank/对话/分块/LLM
 │       ├── chat_service.py  # SSE 流式核心（手动编排节点 + OpenAI SDK 流式）
 │       ├── llm_provider.py  # LLM Provider 层（OpenAI SDK 直连，thinking 开关）
-│       ├── document_service.py  # PDF 走 MinerU（OCR/表格/公式），失败回退 pymupdf4llm
-│       ├── text_splitter.py # 多策略分块（含 </table> 表格保护）
+│       ├── ragas_embed_adapter.py  # BGE-M3→RAGAS Embeddings 适配器
+│       ├── document_service.py  # 文档解析（MinerU/MarkItDown）+ 异步处理 + MinerU限流
+│       ├── text_splitter.py # 多策略分块（含 html_preserve 表格保护）
 │       ├── embedding_service.py  # BGE-M3（dense+sparse 双编码，device 自适应）
 │       └── rerank_service.py
 ├── static/                  # 前端静态资源
