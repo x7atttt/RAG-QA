@@ -15,6 +15,24 @@ def _auth_header(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _wait_document_done(client, token: str, doc_id: int, timeout: int = 30) -> str:
+    """轮询文档列表，等待指定文档状态变为 done/failed（后台处理完成）。
+
+    C2 异步上传：upload 立即返回 pending，后台 BackgroundTasks 处理。
+    测试需要等后台跑完才能验证 chunk_count 等结果。
+    """
+    import asyncio
+
+    for _ in range(timeout):
+        await asyncio.sleep(1)
+        resp = await client.get("/api/documents/list", headers=_auth_header(token))
+        docs = resp.json()["data"]["documents"]
+        doc = next((d for d in docs if d["id"] == doc_id), None)
+        if doc and doc["status"] in ("done", "failed"):
+            return doc["status"]
+    return "timeout"
+
+
 @pytest.mark.asyncio
 async def test_upload_markdown(client):
     token = await _register_and_login(client)
@@ -29,7 +47,12 @@ async def test_upload_markdown(client):
     assert body["code"] == 0
     assert body["data"]["filename"] == "test.md"
     assert body["data"]["file_type"] == "md"
-    assert body["data"]["chunk_count"] >= 1
+    assert body["data"]["status"] == "pending"  # 异步：立即返回 pending
+
+    # 轮询等待后台处理完成（pending → processing → done）
+    doc_id = body["data"]["id"]
+    status = await _wait_document_done(client, token, doc_id, timeout=30)
+    assert status == "done", f"文档处理超时或失败，最终状态: {status}"
 
 
 @pytest.mark.asyncio
@@ -200,8 +223,12 @@ async def test_upload_with_replace_id_updates(client):
     list_resp = await client.get("/api/documents/list", headers=_auth_header(token))
     docs = [d for d in list_resp.json()["data"]["documents"] if d["filename"] == "updatable.md"]
     assert len(docs) == 1
-    # 新文档的 chunk_count > 0（确实重新解析入库了，不是空壳）
-    assert new_doc["chunk_count"] >= 1
+    # 等后台处理完成后验证 chunk_count > 0（异步：上传时 pending，chunk_count=0）
+    status = await _wait_document_done(client, token, new_doc["id"], timeout=30)
+    assert status == "done", f"更新文档处理失败: {status}"
+    list_resp2 = await client.get("/api/documents/list", headers=_auth_header(token))
+    updated = next(d for d in list_resp2.json()["data"]["documents"] if d["id"] == new_doc["id"])
+    assert updated["chunk_count"] >= 1
 
 
 @pytest.mark.asyncio

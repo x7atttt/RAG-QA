@@ -11,6 +11,7 @@ import requests
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.database import async_session_factory
 from app.core.exceptions import BizError
 from app.core.response import ResponseCode
 from app.models import Document
@@ -23,6 +24,17 @@ SUPPORTED_EXTS = {"pdf", "docx", "md"}
 
 _chroma_client: chromadb.api.ClientAPI | None = None
 _chroma_lock = asyncio.Lock()
+# MinerU 云 API 并发限制：防批量上传时打到云 API 触发限流/静默降级
+# Semaphore 在事件循环内生效，限制同时进行的 MinerU 解析数
+_mineru_sem: asyncio.Semaphore | None = None
+
+
+def _get_mineru_sem() -> asyncio.Semaphore:
+    """延迟初始化 MinerU 并发信号量（asyncio.Semaphore 必须在事件循环内创建）。"""
+    global _mineru_sem
+    if _mineru_sem is None:
+        _mineru_sem = asyncio.Semaphore(2)
+    return _mineru_sem
 
 
 def get_chroma_client() -> chromadb.api.ClientAPI:
@@ -180,7 +192,105 @@ def chunk_text(text: str, chunk_size: int | None = None, overlap: int | None = N
 
 async def parse_file(file_path: str, ext: str) -> str:
     parsers = {"pdf": _parse_pdf_sync, "docx": _parse_docx_sync, "md": _parse_markdown_sync}
+    if ext == "pdf":
+        # MinerU 云 API 限并发（防批量上传打到云 API 触发限流/静默降级）
+        # 非并发瓶颈的本地解析（docx/md）不限流
+        async with _get_mineru_sem():
+            return await asyncio.to_thread(parsers[ext], file_path)
     return await asyncio.to_thread(parsers[ext], file_path)
+
+
+async def create_pending_document(
+    filename: str,
+    ext: str,
+    file_size: int,
+    user_id: int,
+    db: AsyncSession,
+    file_hash: str | None = None,
+) -> Document:
+    """创建 pending 状态的文档记录（解析前入库，供前端轮询状态）。
+
+    C2 异步上传：先建 status=pending 的记录立即返回，实际解析在后台
+    process_pending_document 跑。前端轮询列表看到 pending→processing→done。
+    """
+    document = Document(
+        user_id=user_id,
+        filename=filename,
+        file_type=ext,
+        chunk_count=0,
+        file_size=file_size,
+        file_hash=file_hash,
+        status="pending",
+    )
+    db.add(document)
+    await db.commit()
+    await db.refresh(document)
+    return document
+
+
+async def process_pending_document(
+    document_id: int,
+    file_path: str,
+    ext: str,
+    user_id: int,
+) -> None:
+    """后台处理 pending 文档：解析 → 分块 → embedding → 入库 → 更新 status。
+
+    独立于 HTTP 请求运行（BackgroundTasks 调起），内部新建独立 AsyncSession
+    （不复用请求的 session，请求结束后 session 已关闭）。
+
+    状态流转：pending → processing → done（成功）/ failed（异常，记录错误信息）。
+    失败时清理已落盘的文件，status 置 failed，不影响其他文档。
+    """
+    from app.services.text_splitter import split_text
+
+    # 独立 session（脱离请求生命周期）
+    async with async_session_factory() as db:
+        doc = await db.get(Document, document_id)
+        if doc is None:
+            logger.warning(f"后台处理：文档 {document_id} 不存在")
+            return
+
+        try:
+            doc.status = "processing"
+            await db.commit()
+
+            text = await parse_file(file_path, ext)
+            if not text:
+                raise RuntimeError("解析内容为空（可能是扫描版 PDF 且 OCR 失败）")
+
+            chunks = await asyncio.to_thread(
+                split_text, text, settings.split_strategy,
+                settings.chunk_size, settings.chunk_overlap, ext,
+            )
+            if not chunks:
+                raise RuntimeError("分块结果为空")
+
+            embeddings = await encode_texts(chunks)
+
+            async with _chroma_lock:
+                collection = get_user_collection(user_id)
+                ids = [f"{doc.id}_chunk_{i}" for i in range(len(chunks))]
+                metadatas = [
+                    {"user_id": user_id, "document_id": doc.id,
+                     "filename": doc.filename, "chunk_index": i}
+                    for i in range(len(chunks))
+                ]
+                collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+
+            doc.chunk_count = len(chunks)
+            doc.status = "done"
+            await db.commit()
+            logger.info(f"文档 {document_id} ({doc.filename}) 处理完成，{len(chunks)} chunks")
+        except Exception as e:
+            logger.warning(f"文档 {document_id} 处理失败: {e}")
+            doc.status = "failed"
+            await db.commit()
+            # 清理已落盘的文件
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 
 async def process_document(
@@ -192,6 +302,11 @@ async def process_document(
     db: AsyncSession,
     file_hash: str | None = None,
 ) -> Document:
+    """同步处理文档（解析+分块+embedding+入库），供测试和兼容旧调用。
+
+    生产路径走 create_pending_document + process_pending_document（异步），
+    本函数保留是为了 tests 和不需要异步的简单场景。
+    """
     if ext not in SUPPORTED_EXTS:
         raise BizError(
             code=ResponseCode.UNSUPPORTED_FILE_TYPE,
@@ -207,7 +322,6 @@ async def process_document(
             http_status=400,
         )
 
-    # 分块：按配置策略切分（auto/fixed/markdown/recursive），传 ext 供 auto 路由
     from app.services.text_splitter import split_text
 
     chunks = await asyncio.to_thread(
@@ -225,6 +339,7 @@ async def process_document(
         chunk_count=len(chunks),
         file_size=file_size,
         file_hash=file_hash,
+        status="done",
     )
     db.add(document)
     await db.commit()

@@ -25,6 +25,9 @@ async def init_db() -> None:
         # 轻量迁移：为旧库补列
         await _ensure_column(conn, "messages", "reasoning", "TEXT")
         await _ensure_column(conn, "documents", "file_hash", "TEXT")
+        # status 字段：旧文档视为已完成（UPDATE 兜底 NULL → done）
+        await _ensure_column(conn, "documents", "status", "TEXT DEFAULT 'done'")
+        await conn.execute(text("UPDATE documents SET status = 'done' WHERE status IS NULL"))
         # 用户内去重：同 user_id + file_hash 唯一（SQLite 中多个 NULL 不冲突，旧数据安全）
         await conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_user_hash "

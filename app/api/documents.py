@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,8 +10,9 @@ from app.models import Document, User
 from app.schemas.document import DocumentListData, DocumentOut
 from app.services.document_service import (
     SUPPORTED_EXTS,
+    create_pending_document,
     delete_document,
-    process_document,
+    process_pending_document,
     save_upload_file,
 )
 
@@ -24,6 +25,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 async def upload(
     file: UploadFile = File(...),
     replace_id: int | None = None,
+    background_tasks: BackgroundTasks = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -91,24 +93,28 @@ async def upload(
             )
 
     file_path, _ = save_upload_file(content, ext)
-    try:
-        document = await process_document(
-            file_path=file_path,
-            filename=file.filename,
-            ext=ext,
-            file_size=len(content),
-            user_id=user.id,
-            db=db,
-            file_hash=file_hash,
-        )
-    except Exception:
-        import os
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise
-
-    return success_response(DocumentOut.model_validate(document).model_dump(mode="json"), "上传成功")
+    # C2 异步上传：先建 pending 记录立即返回，后台解析（前端轮询状态 pending→done）
+    # 同事件循环 BackgroundTasks：_chroma_lock / MinerU Semaphore 天然有效
+    document = await create_pending_document(
+        filename=file.filename,
+        ext=ext,
+        file_size=len(content),
+        user_id=user.id,
+        db=db,
+        file_hash=file_hash,
+    )
+    # 后台处理：解析→分块→embedding→入库，独立 session（不复用请求的）
+    background_tasks.add_task(
+        process_pending_document,
+        document_id=document.id,
+        file_path=file_path,
+        ext=ext,
+        user_id=user.id,
+    )
+    return success_response(
+        DocumentOut.model_validate(document).model_dump(mode="json"),
+        "已接收，后台处理中",
+    )
 
 
 @router.get("/list")
