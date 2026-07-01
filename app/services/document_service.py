@@ -380,10 +380,132 @@ async def process_document(
     return document
 
 
-async def delete_document(document: Document, db: AsyncSession) -> None:
-    import logging
+async def update_document_chunks(
+    document: Document, new_chunks: list[str], user_id: int, db: AsyncSession
+) -> dict:
+    """文档增量更新：按分块 content_hash 集合 diff，仅对变化块重算向量。
 
-    logger = logging.getLogger("docqa.document")
+    流程：
+      1. 取旧文档在 ChromaDB 的所有块（含 content_hash metadata）
+      2. 对新分块算 content_hash，集合 diff：
+         - 旧有新无（removed）→ 删除消失的块
+         - 新有旧无（added）→ encode 新增块后 upsert
+         - 都有且 hash 同 → 复用旧向量（核心省算力）
+      3. 边界漂移检测：变化率 > incremental_update_threshold → 降级全量重建
+         （改一处导致分块边界整体后移时，diff 无收益，不如直接重建）
+      4. 旧文档无 content_hash（stage-14 之前的数据）→ removed 含全部旧块，
+         变化率必然超阈值 → 自动降级全量，首次更新后补全 hash
+
+    返回统计 dict（added/removed/reused/degraded），供调用方记录日志。
+    """
+    collection = get_user_collection(user_id)
+    new_hashes = [_compute_chunk_hash(c) for c in new_chunks]
+    new_hash_set = set(new_hashes)
+
+    # 取旧块（含 metadata，用于读 content_hash 和定位 id）
+    async with _chroma_lock:
+        old = collection.get(
+            where={"document_id": document.id},
+            include=["metadatas"],
+        )
+    old_ids = old["ids"]
+    old_metas = old["metadatas"]
+    # 旧块可能无 content_hash（stage-14 前数据），用 .get 兜底为空串
+    old_hash_to_ids: dict[str, list[str]] = {}
+    for oid, meta in zip(old_ids, old_metas):
+        h = meta.get("content_hash", "")
+        old_hash_to_ids.setdefault(h, []).append(oid)
+    old_hash_set = set(old_hash_to_ids.keys())
+
+    # 集合 diff（顺序无关）
+    added_hashes = new_hash_set - old_hash_set
+    removed_hashes = old_hash_set - new_hash_set
+    reused_count = len(new_hash_set & old_hash_set)
+
+    # 边界漂移检测：变化率超阈值降级全量重建
+    union_size = len(new_hash_set | old_hash_set)
+    changed_ratio = (len(added_hashes) + len(removed_hashes)) / max(union_size, 1)
+    if changed_ratio > settings.incremental_update_threshold:
+        stats = await _full_rebuild_chunks(document, new_chunks, user_id, db)
+        stats["degraded"] = True
+        logger.info(
+            f"文档 {document.id} 变化率 {changed_ratio:.0%} > 阈值，降级全量重建"
+        )
+        return stats
+
+    # 增量路径：删除消失块
+    removed_ids: list[str] = []
+    for h in removed_hashes:
+        removed_ids.extend(old_hash_to_ids.get(h, []))
+    # 新增块：用 hash 找回对应的 chunk 文本（集合 diff 后需重建 id+metadata）
+    added_chunks = [
+        (i, c) for i, (c, h) in enumerate(zip(new_chunks, new_hashes)) if h in added_hashes
+    ]
+
+    async with _chroma_lock:
+        if removed_ids:
+            collection.delete(ids=removed_ids)
+        if added_chunks:
+            added_texts = [c for _, c in added_chunks]
+            added_embeddings = await encode_texts(added_texts)
+            # 新增块用位置 id（_chunk_{i}），与旧块 id 空间不冲突（旧块的对应位置
+            # 要么已删除要么是复用块——复用块 id 仍在但 hash 不同会作为 added 重算）
+            added_ids = [f"{document.id}_chunk_{i}" for i, _ in added_chunks]
+            added_metas = [
+                {
+                    "user_id": user_id,
+                    "document_id": document.id,
+                    "filename": document.filename,
+                    "chunk_index": i,
+                    "content_hash": _compute_chunk_hash(c),
+                }
+                for i, c in added_chunks
+            ]
+            collection.upsert(
+                ids=added_ids,
+                embeddings=added_embeddings,
+                documents=added_texts,
+                metadatas=added_metas,
+            )
+
+    document.chunk_count = len(new_chunks)
+    await db.commit()
+    stats = {
+        "added": len(added_chunks),
+        "removed": len(removed_ids),
+        "reused": reused_count,
+        "degraded": False,
+    }
+    logger.info(
+        f"文档 {document.id} 增量更新完成：+{stats['added']} -{stats['removed']} "
+        f"复用{stats['reused']}（共 {len(new_chunks)} 块）"
+    )
+    return stats
+
+
+async def _full_rebuild_chunks(
+    document: Document, chunks: list[str], user_id: int, db: AsyncSession
+) -> dict:
+    """全量重建：删旧文档所有块 + 重新 add 全部新块（含 content_hash）。
+
+    增量更新的降级路径（变化率超阈值或旧数据无 content_hash 时触发）。
+    """
+    async with _chroma_lock:
+        collection = get_user_collection(user_id)
+        # 删旧
+        collection.delete(where={"document_id": document.id})
+        # 重算全部 + 入库
+        embeddings = await encode_texts(chunks)
+        ids = [f"{document.id}_chunk_{i}" for i in range(len(chunks))]
+        metadatas = _build_chunk_metadata(user_id, document.id, document.filename, chunks)
+        collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+
+    document.chunk_count = len(chunks)
+    await db.commit()
+    return {"added": len(chunks), "removed": len(chunks), "reused": 0, "degraded": True}
+
+
+async def delete_document(document: Document, db: AsyncSession) -> None:
     document_id = document.id
     user_id = document.user_id
     await db.delete(document)
