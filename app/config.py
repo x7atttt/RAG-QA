@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # 每用户最大会话数（超出拒绝创建，提示先删除旧会话）
     max_conversations: int = 10
 
+    # ============ 文档增量更新 ============
+    # 更新文档时，按分块 content_hash 集合 diff，仅重算变化块。
+    # 变化块占比超此阈值（边界漂移严重）则降级全量重建。
+    incremental_update_threshold: float = 0.5
+
     # ============ 会话记忆 / 历史管理 ============
     # 生成答案时历史的最大轮数上限（每轮 = user + assistant 两条消息）
     max_history_rounds: int = 5

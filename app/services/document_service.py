@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import logging
 import os
@@ -50,6 +51,30 @@ def get_user_collection(user_id: int) -> chromadb.Collection:
         name=f"doc_user_{user_id}",
         metadata={"hnsw:space": "cosine"},
     )
+
+
+def _compute_chunk_hash(chunk: str) -> str:
+    """计算单个分块的内容哈希（sha256 截 16 位），用于增量更新 diff。"""
+    return hashlib.sha256(chunk.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_chunk_metadata(
+    user_id: int, doc_id: int, filename: str, chunks: list[str]
+) -> list[dict]:
+    """统一生成分块元数据列表（含 content_hash，供增量更新 diff 用）。
+
+    抽出来消除 process_pending_document / process_document 两处的重复。
+    """
+    return [
+        {
+            "user_id": user_id,
+            "document_id": doc_id,
+            "filename": filename,
+            "chunk_index": i,
+            "content_hash": _compute_chunk_hash(chunk),
+        }
+        for i, chunk in enumerate(chunks)
+    ]
 
 
 def _parse_pdf_pymupdf_sync(file_path: str) -> str:
@@ -271,11 +296,7 @@ async def process_pending_document(
             async with _chroma_lock:
                 collection = get_user_collection(user_id)
                 ids = [f"{doc.id}_chunk_{i}" for i in range(len(chunks))]
-                metadatas = [
-                    {"user_id": user_id, "document_id": doc.id,
-                     "filename": doc.filename, "chunk_index": i}
-                    for i in range(len(chunks))
-                ]
+                metadatas = _build_chunk_metadata(user_id, doc.id, doc.filename, chunks)
                 collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
 
             doc.chunk_count = len(chunks)
@@ -349,15 +370,7 @@ async def process_document(
         async with _chroma_lock:
             collection = get_user_collection(user_id)
             ids = [f"{document.id}_chunk_{i}" for i in range(len(chunks))]
-            metadatas = [
-                {
-                    "user_id": user_id,
-                    "document_id": document.id,
-                    "filename": filename,
-                    "chunk_index": i,
-                }
-                for i in range(len(chunks))
-            ]
+            metadatas = _build_chunk_metadata(user_id, document.id, filename, chunks)
             collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
     except Exception:
         await db.delete(document)
