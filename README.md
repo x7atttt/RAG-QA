@@ -19,6 +19,7 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 - [📁 项目结构](#-项目结构)
 - [🧩 分块策略](#-分块策略可配置切换)
 - [🧠 会话记忆](#-会话记忆)
+- [♻️ 文档增量更新](#-文档增量更新)
 - [🔍 检索与评测](#-检索与评测)
 - [🚀 快速开始](#-快速开始)
 - [📡 API 概览](#-api-概览)
@@ -132,6 +133,7 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 - `pdf`/`docx` 经 MinerU/MarkItDown 转换后，标题层级按字号推断可能不规整，recursive 更稳健
 - `fixed` 在任何场景都不如 recursive（recursive 最差情况退化为 fixed），故不作为自动选项
 - 递归分隔符含 `</table>`，保护中小 HTML 表格不在分块时被切断（MinerU 表格输出为 HTML）
+- 四种策略均为纯函数（确定性分块），相同文本必产生相同分块——这是[文档增量更新](#-文档增量更新)按 content_hash diff 的前提
 
 > 实现见 [`app/services/text_splitter.py`](app/services/text_splitter.py)，测试见 [`tests/test_chunking.py`](tests/test_chunking.py)（含 HTML 表格保护测试）。
 
@@ -161,6 +163,30 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 - **历史缓存**：热点会话历史 Redis 缓存（按会话维度），写消息/删会话时失效
 
 > 实现见 [`app/agent/memory.py`](app/agent/memory.py) + [`app/services/summary_service.py`](app/services/summary_service.py)，测试见 [`tests/test_memory.py`](tests/test_memory.py) / [`tests/test_summary.py`](tests/test_summary.py)。
+
+---
+
+## ♻️ 文档增量更新
+
+更新文档时不再"整删整传全量重算"，而是按分块内容哈希 diff，仅重算变化块：
+
+```
+更新文档(replace_id) → 复用旧文档记录（id 不变）
+  ↓
+新分块算 content_hash → 与旧块 hash 集合 diff
+  ↓
+added（新增块）→ encode + upsert
+removed（消失块）→ delete
+未变块 → 复用旧向量（核心省算力）
+  ↓
+变化率 > 50%（分块边界漂移）→ 自动降级全量重建
+```
+
+- **集合 diff（顺序无关）**：按 content_hash 集合比对，不按 chunk_index 位置对齐——位置 diff 在边界漂移时会全部错位误判
+- **边界漂移降级**：recursive/fixed 策略用 overlap 滑窗，中间改一处会让后续块边界整体后移，导致大量块文本变化，此时逐块 upsert 比全量重建慢，故变化率超阈值直接降级
+- **旧数据兼容**：stage-14 前的文档无 content_hash，首次更新自动降级全量，重建后补全 hash，后续增量生效
+
+> 实现见 [`app/services/document_service.py`](app/services/document_service.py) 的 `update_document_chunks`，测试见 [`tests/test_incremental_update.py`](tests/test_incremental_update.py)。
 
 ---
 
@@ -330,7 +356,7 @@ event: error          data: {"message":"..."}   # 异常
 uv run pytest
 ```
 
-主要覆盖：文档分块（15 用例）、Embedding 维度、认证、缓存、限流、会话记忆（token 截断/摘要注入/历史缓存）、query 改写、中英混排等。
+主要覆盖（100+ 用例）：文档分块、Embedding 维度、认证、缓存（三防 + 多轮版本隔离 + 历史缓存）、限流、会话记忆（token 截断/摘要注入/摘要生成）、query 改写、文档增量更新（集合 diff/降级全量/旧数据兼容）、中英混排等。
 
 ---
 
