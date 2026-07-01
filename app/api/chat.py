@@ -76,7 +76,9 @@ async def ask(
     summary = await _load_summary(conversation_id)
 
     # 缓存按会话隔离（key 含 conversation_id）
-    hit, cached = await get_cached_answer(user_id, question, conversation_id)
+    # history_version：用历史消息条数做上下文版本，避免多轮追问时命中上一轮上下文的过期答案
+    hver = len(history)
+    hit, cached = await get_cached_answer(user_id, question, conversation_id, hver)
     if hit and cached and cached.get("answer") and bool(cached.get("thinking", False)) == thinking:
         return StreamingResponse(
             _stream_cached(cached, "hit"),
@@ -84,19 +86,19 @@ async def ask(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    lock_token: str | None = await acquire_lock(user_id, question, conversation_id)
+    lock_token: str | None = await acquire_lock(user_id, question, conversation_id, history_version=hver)
 
     if lock_token is None:
         for _ in range(8):
             await asyncio.sleep(0.3)
-            hit2, cached2 = await get_cached_answer(user_id, question, conversation_id)
+            hit2, cached2 = await get_cached_answer(user_id, question, conversation_id, hver)
             if hit2 and cached2 and cached2.get("answer") and bool(cached2.get("thinking", False)) == thinking:
                 return StreamingResponse(
                     _stream_cached(cached2, "wait"),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
-        lock_token = await acquire_lock(user_id, question, conversation_id)
+        lock_token = await acquire_lock(user_id, question, conversation_id, history_version=hver)
         if lock_token is None:
             lock_token = "no-redis"
 
@@ -141,6 +143,7 @@ async def ask(
                     background_tasks=background_tasks,
                     thinking=thinking,
                     conversation_id=conversation_id,
+                    history_version=hver,
                 )
             )
 
@@ -232,15 +235,16 @@ async def _finalize(
     background_tasks: BackgroundTasks | None = None,
     thinking: bool = False,
     conversation_id: int | None = None,
+    history_version: int = 0,
 ) -> None:
     answer = "".join(answer_parts)
     reasoning = "".join(reasoning_parts) if reasoning_parts else ""
     if lock_token:
-        await release_lock(user_id, question, lock_token, conversation_id)
+        await release_lock(user_id, question, lock_token, conversation_id, history_version)
     if error_msg or not answer:
         return
     try:
-        await set_cached_answer(user_id, question, answer, sources, conversation_id, reasoning, thinking)
+        await set_cached_answer(user_id, question, answer, sources, conversation_id, reasoning, thinking, history_version)
     except Exception:
         pass
     try:

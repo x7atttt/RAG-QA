@@ -42,34 +42,54 @@ def _normalize(question: str) -> str:
     return question.strip().lower()
 
 
-def _qa_key(user_id: int, question: str, conversation_id: int | None = None) -> str:
+def _qa_key(
+    user_id: int,
+    question: str,
+    conversation_id: int | None = None,
+    history_version: int = 0,
+) -> str:
     h = hashlib.sha1(_normalize(question).encode("utf-8")).hexdigest()[:16]
     cid = conversation_id or 0  # 无会话 id 用 0 兜底（兼容）
-    return f"qa:user_{user_id}:conv_{cid}:{h}"
+    # history_version：当前历史消息条数。多轮追问时同问题的上下文不同，
+    # 用版本号区分避免命中上一轮上下文生成的过期答案。
+    return f"qa:user_{user_id}:conv_{cid}:{h}:h{history_version}"
 
 
-def _null_key(user_id: int, question: str, conversation_id: int | None = None) -> str:
-    return "null:" + _qa_key(user_id, question, conversation_id)
+def _null_key(
+    user_id: int,
+    question: str,
+    conversation_id: int | None = None,
+    history_version: int = 0,
+) -> str:
+    return "null:" + _qa_key(user_id, question, conversation_id, history_version)
 
 
-def _lock_key(user_id: int, question: str, conversation_id: int | None = None) -> str:
-    return "lock:" + _qa_key(user_id, question, conversation_id)
+def _lock_key(
+    user_id: int,
+    question: str,
+    conversation_id: int | None = None,
+    history_version: int = 0,
+) -> str:
+    return "lock:" + _qa_key(user_id, question, conversation_id, history_version)
 
 
 async def get_cached_answer(
-    user_id: int, question: str, conversation_id: int | None = None
+    user_id: int,
+    question: str,
+    conversation_id: int | None = None,
+    history_version: int = 0,
 ) -> tuple[bool, dict | None]:
     client = await get_redis()
     if client is None:
         return False, None
     try:
-        raw = await client.get(_qa_key(user_id, question, conversation_id))
+        raw = await client.get(_qa_key(user_id, question, conversation_id, history_version))
         if raw is not None:
             try:
                 return True, json.loads(raw)
             except json.JSONDecodeError:
                 return True, {"answer": raw, "sources": []}
-        if await client.exists(_null_key(user_id, question, conversation_id)):
+        if await client.exists(_null_key(user_id, question, conversation_id, history_version)):
             return True, {"answer": "", "sources": []}
     except Exception as e:
         logger.warning(f"Redis 读取失败：{e}")
@@ -84,6 +104,7 @@ async def set_cached_answer(
     conversation_id: int | None = None,
     reasoning: str | None = None,
     thinking: bool = False,
+    history_version: int = 0,
 ) -> None:
     client = await get_redis()
     if client is None:
@@ -91,7 +112,7 @@ async def set_cached_answer(
     try:
         if not answer:
             await client.set(
-                _null_key(user_id, question, conversation_id), "1", ex=settings.cache_null_ttl_seconds
+                _null_key(user_id, question, conversation_id, history_version), "1", ex=settings.cache_null_ttl_seconds
             )
             return
         payload = json.dumps(
@@ -106,13 +127,17 @@ async def set_cached_answer(
         base = settings.cache_ttl_seconds
         jitter = random.randint(-int(base * 0.2), int(base * 0.2))
         ttl = max(60, base + jitter)
-        await client.set(_qa_key(user_id, question, conversation_id), payload, ex=ttl)
+        await client.set(_qa_key(user_id, question, conversation_id, history_version), payload, ex=ttl)
     except Exception as e:
         logger.warning(f"Redis 写入失败：{e}")
 
 
 async def acquire_lock(
-    user_id: int, question: str, conversation_id: int | None = None, expire: int = 15
+    user_id: int,
+    question: str,
+    conversation_id: int | None = None,
+    expire: int = 15,
+    history_version: int = 0,
 ) -> str | None:
     """成功返回 token 字符串（释放时校验）；失败返回 None。Redis 不可用返回伪 token。"""
     client = await get_redis()
@@ -120,7 +145,7 @@ async def acquire_lock(
         return "no-redis"
     token = uuid.uuid4().hex
     try:
-        ok = await client.set(_lock_key(user_id, question, conversation_id), token, nx=True, ex=expire)
+        ok = await client.set(_lock_key(user_id, question, conversation_id, history_version), token, nx=True, ex=expire)
         return token if ok else None
     except Exception as e:
         logger.warning(f"Redis 加锁失败：{e}")
@@ -128,7 +153,11 @@ async def acquire_lock(
 
 
 async def release_lock(
-    user_id: int, question: str, token: str | None, conversation_id: int | None = None
+    user_id: int,
+    question: str,
+    token: str | None,
+    conversation_id: int | None = None,
+    history_version: int = 0,
 ) -> None:
     if not token:
         return
@@ -142,7 +171,7 @@ async def release_lock(
             "if redis.call('GET', KEYS[1]) == ARGV[1] then "
             "return redis.call('DEL', KEYS[1]) else return 0 end"
         )
-        await client.eval(script, 1, _lock_key(user_id, question, conversation_id), token)
+        await client.eval(script, 1, _lock_key(user_id, question, conversation_id, history_version), token)
     except Exception as e:
         logger.warning(f"Redis 释放锁失败：{e}")
 
