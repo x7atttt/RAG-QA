@@ -3,6 +3,9 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from app.agent.state import AgentState
+from app.config import get_settings
+
+settings = get_settings()
 
 
 def sse(event: str, data: Any) -> str:
@@ -52,6 +55,8 @@ async def stream_graph(
         "user_id": user_id,
         "question": question,
         "rewritten_query": "",
+        "transformed_query": "",
+        "retrieval_attempts": 0,
         "history": history or [],
         "summary": summary or "",
         "thinking": thinking,
@@ -97,7 +102,7 @@ async def stream_graph(
             docs = state.get("retrieved_docs", [])
             sources = state.get("sources", [])
             top_score = sources[0].get("score", 0) if sources else 0
-            if docs and top_score >= 0.5:
+            if docs and top_score >= settings.retrieval_score_threshold:
                 messages = _build_rag_prompt(question_text, docs, history_list, summary_text)
             else:
                 messages = _build_fallback_prompt(question_text, docs, history_list, summary_text)

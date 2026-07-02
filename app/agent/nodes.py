@@ -296,10 +296,10 @@ async def generate_answer(state: AgentState) -> AgentState:
     #   典型场景：用户上传简历后问"怎么改进简历"——文档有简历内容但无现成建议，
     #   严格 RAG 会硬拒绝，fallback 让模型结合简历实际情况给针对性建议。
     top_score = sources[0].get("score", 0) if sources else 0
-    if docs and top_score >= 0.5:
-        messages = _build_rag_prompt(question, docs, history)
+    if docs and top_score >= settings.retrieval_score_threshold:
+        messages = _build_rag_prompt(question, docs, history, summary)
     else:
-        messages = _build_fallback_prompt(question, docs, history)
+        messages = _build_fallback_prompt(question, docs, history, summary)
 
     # 流式生成：thinking 模式下 reasoning_content 先于 content 返回（由 chat_service 捕获）
     tokens: list[str] = []

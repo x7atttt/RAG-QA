@@ -20,6 +20,10 @@ class AgentState(TypedDict, total=False):
     question: str
     # query 改写：多轮指代消解后的检索 query（仅检索用，生成仍用原始 question）
     rewritten_query: str
+    # CRAG 变体：基于"检索结果差"改写的同义/换角度 query（仅重查触发，优先级高于 rewritten_query）
+    transformed_query: str
+    # CRAG 循环计数：低相关重查的次数，达 crag_max_attempts 后不再重查走 fallback
+    retrieval_attempts: int
     # 意图路由
     should_retrieve: bool
     # 检索

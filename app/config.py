@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # RRF（Reciprocal Rank Fusion）常数 k：score = Σ 1/(k + rank_i)，标准值 60
     # k 越大，排名靠后的项衰减越慢（对各路更均衡）；k 越小，头部项权重越大
     rrf_k: int = 60
+    # 检索相关度阈值：top rerank score 低于此值视为低相关
+    # （CRAG 重查触发 + RAG vs fallback 分流共用同一阈值，避免逻辑矛盾）
+    # rerank 用 normalize=True，分数 ∈ [0,1]，0.5 是经验值
+    retrieval_score_threshold: float = 0.5
+    # CRAG（Corrective RAG）重查最大次数：低相关时改写 query 变体重检索
+    # 0=关闭退回线性 RAG，1=标准 CRAG 单次重查（延迟换准确率的取舍）
+    crag_max_attempts: int = 1
     # 每用户最大会话数（超出拒绝创建，提示先删除旧会话）
     max_conversations: int = 10
 
