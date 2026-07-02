@@ -98,6 +98,50 @@ async def rewrite_query(state: AgentState) -> AgentState:
     return state
 
 
+async def transform_query(state: AgentState) -> AgentState:
+    """CRAG 重查：检索得分低 → 基于失败 query + 弱命中片段生成同义/换角度变体。
+
+    与 rewrite_query 的区别：
+    - rewrite_query 消解指代（"它/第三条"→完整问题），基于对话历史，无失败信号
+    - transform_query 基于"检索结果差"做语义扩展（同义词/换角度），基于召回的弱命中片段，
+      仅在 CRAG 重查时触发
+
+    设计：
+    - 输入失败 query + 弱命中 top-3 片段（即便 score 低，可能含相关术语可作线索）
+    - 输出语义等价但表达不同的检索变体，喂给 retrieve_documents 重查
+    - 容错：LLM 异常/输出异常时复用原 query，不阻断重查流程
+    """
+    question = state["question"]
+    # 基线：优先用已有的改写结果（指代消解后的），避免丢失 rewrite 的成果
+    base = state.get("transformed_query") or state.get("rewritten_query") or question
+    # 弱命中片段：召回的 top-3（即便 score 低，可能含相关术语可作线索）
+    weak_hits = (state.get("retrieved_docs", []) or [])[:3]
+    hits_text = "\n".join(f"- {d[:120]}" for d in weak_hits) or "(无召回)"
+
+    try:
+        messages = [
+            SystemMessage(
+                content=(
+                    "用户的检索 query 召回结果相关度低。请改写成一个语义等价但表达不同的检索 query，"
+                    "尝试：同义词替换、换角度描述、补充专业术语、拆解/重组关键词。\n"
+                    "要求：\n"
+                    "1) 只输出一个改写后的 query，不要任何解释；\n"
+                    "2) 保留原意，不要臆造文档里没有的实体；\n"
+                    "3) 可参考下方弱相关片段里的术语作为线索。"
+                )
+            ),
+            HumanMessage(content=f"原 query：{base}\n弱相关片段：\n{hits_text}\n\n改写后："),
+        ]
+        resp = await chat(messages)
+        # 去除首尾可能的多余引号/句号（含中文弯引号）
+        variant = resp.strip().strip("\"'“”‘’。")
+        state["transformed_query"] = variant or base
+    except Exception:
+        # 改写失败不阻断，复用原 query 重查（至少换个检索角度的机会）
+        state["transformed_query"] = base
+    return state
+
+
 def _rrf_fuse(
     dense_rank: list[int], sparse_rank: list[int], k: int
 ) -> list[int]:
@@ -129,8 +173,9 @@ async def retrieve_documents(state: AgentState) -> AgentState:
     把"字面没对上但语义相关"和"字面正好对上"两类命中都纳入候选。
     """
     question = state["question"]
-    # 检索用改写后的 query（指代消解），生成答案时仍用原始 question
-    search_query = state.get("rewritten_query") or question
+    # 检索用 query 优先级：CRAG 变体（重查触发）> 指代消解后的 query > 原始 question
+    # 生成答案时仍用原始 question（回答针对用户原话）
+    search_query = state.get("transformed_query") or state.get("rewritten_query") or question
     user_id = state["user_id"]
 
     collection = get_user_collection(user_id)
