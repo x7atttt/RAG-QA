@@ -20,6 +20,7 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 - [🧩 分块策略](#-分块策略可配置切换)
 - [🧠 会话记忆](#-会话记忆)
 - [♻️ 文档增量更新](#-文档增量更新)
+- [🔄 CRAG 循环重查](#-crag-循环重查)
 - [🔍 检索与评测](#-检索与评测)
 - [🚀 快速开始](#-快速开始)
 - [📡 API 概览](#-api-概览)
@@ -38,6 +39,7 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | 🧩 **多策略分块** | auto 按文件类型路由（md→markdown，pdf→html_preserve 保护表格，docx→recursive），HTMLSemanticPreservingSplitter 硬保 PDF 超大表格不被切 |
 | 🔍 **RAG 检索增强** | BGE-M3 向量检索（dense+sparse RRF 混合召回）+ BGE-Reranker-v2-M3 交叉编码器精排 |
 | 🤖 **LangGraph Agent** | 状态图编排"意图判断 → query 改写 → 检索 → 生成"链路，意图路由按需检索 |
+| 🔄 **CRAG 循环重查** | Corrective RAG：检索相关度低时改写 query 变体重检索（条件回边循环），仍低才降级，解决 query 表述与文档不一致 |
 | 💬 **多会话管理** | 侧边栏会话列表，新建/切换/删除，每用户上限 10 个，首问自动生成标题 |
 | 💡 **深度思考模式** | DeepSeek thinking 开关，显式控制思考模式启停，推理过程可折叠查看 |
 | ⚡ **SSE 流式输出** | Server-Sent Events 实时打字机效果，推理面板自动展开、答案逐字呈现 |
@@ -187,6 +189,26 @@ removed（消失块）→ delete
 - **旧数据兼容**：stage-14 前的文档无 content_hash，首次更新自动降级全量，重建后补全 hash，后续增量生效
 
 > 实现见 [`app/services/document_service.py`](app/services/document_service.py) 的 `update_document_chunks`，测试见 [`tests/test_incremental_update.py`](tests/test_incremental_update.py)。
+
+---
+
+## 🔄 CRAG 循环重查
+
+从线性 RAG 升级为 Corrective RAG（带循环的状态图）：检索结果相关度低时，改写 query 变体重新检索，仍低才走降级回答。
+
+```
+检索 → 评分（rerank top score）
+  → score≥0.5 → 严格 RAG 生成
+  → score<0.5 且未达重查上限 → transform_query 改写变体 → 回检索（重查）
+  → score<0.5 且达上限 → fallback 降级（文档背景 + 常识）
+```
+
+- **transform_query ≠ rewrite_query**：rewrite 消解指代（基于历史），transform 基于"检索结果差"做同义词/换角度扩展（基于弱命中片段），仅重查触发
+- **LangGraph 条件回边**：retrieve→grade→transform→retrieve 循环，从线性状态图升级为带循环的状态图
+- **静默重查**：不推 status 事件，循环结束后只推送一次 sources（避免前端弱结果→好结果闪烁）
+- **延迟取舍**：重查多 2 次 LLM 调用（首字 5s→9s），但只在低相关时触发，高频问题不受影响
+
+> 实现见 [`app/agent/nodes.py`](app/agent/nodes.py) 的 `transform_query` + `grade_documents`，编排见 [`app/services/chat_service.py`](app/services/chat_service.py)，测试见 [`tests/test_crag.py`](tests/test_crag.py)。
 
 ---
 
@@ -356,7 +378,7 @@ event: error          data: {"message":"..."}   # 异常
 uv run pytest
 ```
 
-主要覆盖（100+ 用例）：文档分块、Embedding 维度、认证、缓存（三防 + 多轮版本隔离 + 历史缓存）、限流、会话记忆（token 截断/摘要注入/摘要生成）、query 改写、文档增量更新（集合 diff/降级全量/旧数据兼容）、中英混排等。
+主要覆盖（110+ 用例）：文档分块、Embedding 维度、认证、缓存（三防 + 多轮版本隔离 + 历史缓存）、限流、会话记忆（token 截断/摘要注入/摘要生成）、query 改写、CRAG 循环重查（变体生成/评分节点/检索优先级）、文档增量更新（集合 diff/降级全量/旧数据兼容）、中英混排等。
 
 ---
 
