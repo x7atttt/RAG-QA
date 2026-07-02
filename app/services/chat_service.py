@@ -80,14 +80,27 @@ async def stream_graph(
         state = await intent_router(state)
 
         if state.get("should_retrieve"):
-            # 2. 检索（含 query 改写，retrieve_documents 内部先跑 rewrite）
-            # 注：retrieve_documents 依赖 rewritten_query，由 rewrite_query 节点填充。
-            # 这里手动补一步 rewrite，再 retrieve（与 graph 编排一致）
-            from app.agent.nodes import rewrite_query
+            # 2. 检索：query 改写（指代消解）+ CRAG 循环重查
+            from app.agent.nodes import rewrite_query, transform_query
 
             state = await rewrite_query(state)
-            state = await retrieve_documents(state)
-            # 推送来源
+            state["retrieval_attempts"] = 0
+            # CRAG 循环：检索后若 top score 低于阈值且未达重查上限 →
+            # transform_query 改写变体 → 重新 retrieve（静默，用户无感）
+            while True:
+                state = await retrieve_documents(state)
+                attempts = state.get("retrieval_attempts", 0)
+                top_score = state["sources"][0].get("score", 0) if state.get("sources") else 0
+                if (
+                    state.get("sources")
+                    and top_score < settings.retrieval_score_threshold
+                    and attempts < settings.crag_max_attempts
+                ):
+                    state["retrieval_attempts"] = attempts + 1
+                    state = await transform_query(state)
+                    continue  # 用变体重查
+                break
+            # 循环结束后只推送一次 sources（避免前端弱结果→好结果闪烁）
             if state.get("sources"):
                 yield ("sources", state["sources"])
         else:

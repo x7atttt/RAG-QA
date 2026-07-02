@@ -155,3 +155,50 @@ async def test_retrieve_falls_back_to_rewritten_query_without_transform():
         await retrieve_documents(state)
 
     assert captured_query.get("value") == "指代消解后的问题"
+
+
+# ============ grade_documents 评分节点测试 ============
+
+def test_grade_high_score_no_retry():
+    """top score ≥ 阈值 → 不触发重查（should_retry=False）。"""
+    from app.agent.nodes import grade_documents
+
+    state = _make_state()
+    state["sources"] = [{"score": 0.89}, {"score": 0.7}]
+    result = grade_documents(state)
+    assert result["meta"]["should_retry"] is False
+
+
+def test_grade_low_score_triggers_retry():
+    """top score < 阈值 且未达上限 → 触发重查（should_retry=True, attempts+1）。"""
+    from app.agent.nodes import grade_documents
+
+    state = _make_state()
+    state["sources"] = [{"score": 0.3}]  # 低于阈值 0.5
+    state["retrieval_attempts"] = 0
+    result = grade_documents(state)
+    assert result["meta"]["should_retry"] is True
+    assert result["retrieval_attempts"] == 1  # 计数 +1
+
+
+def test_grade_max_attempts_no_retry():
+    """已达重查上限 → 不再重查（即使 score 低）。"""
+    from app.agent.nodes import grade_documents
+    from app.config import get_settings
+
+    max_attempts = get_settings().crag_max_attempts  # 默认 1
+    state = _make_state()
+    state["sources"] = [{"score": 0.2}]  # 仍然低
+    state["retrieval_attempts"] = max_attempts  # 已达上限
+    result = grade_documents(state)
+    assert result["meta"]["should_retry"] is False  # 不再重查，走 fallback
+
+
+def test_grade_empty_sources_no_retry():
+    """无召回结果 → 不重查（没有内容可改写，直接走 fallback）。"""
+    from app.agent.nodes import grade_documents
+
+    state = _make_state()
+    state["sources"] = []
+    result = grade_documents(state)
+    assert result["meta"]["should_retry"] is False

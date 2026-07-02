@@ -328,6 +328,29 @@ def _build_fallback_prompt(
     return _inject_summary(messages, summary)
 
 
+def grade_documents(state: AgentState) -> AgentState:
+    """CRAG 评分节点（纯逻辑，不调 LLM）：检查检索 top score 决定是否重查。
+
+    给 graph.py 的条件边用：score 低且未达重查上限 → 标记 retry（走 transform_query 重查）；
+    否则 → 标记 generate（走 generate_answer 生成）。
+    chat_service 的手动编排路径不经过此节点（它自己用 while 循环控制），
+    这里仅保持 graph 声明一致 + 便于面试展示完整 CRAG 循环图。
+    """
+    sources = state.get("sources", [])
+    top_score = sources[0].get("score", 0) if sources else 0
+    attempts = state.get("retrieval_attempts", 0)
+    # 低相关 + 有召回 + 未达重查上限 → 重查
+    should_retry = (
+        bool(sources)
+        and top_score < settings.retrieval_score_threshold
+        and attempts < settings.crag_max_attempts
+    )
+    if should_retry:
+        state["retrieval_attempts"] = attempts + 1
+    state["meta"] = {**(state.get("meta") or {}), "should_retry": should_retry}
+    return state
+
+
 async def generate_answer(state: AgentState) -> AgentState:
     question = state["question"]
     docs = state.get("retrieved_docs", [])
