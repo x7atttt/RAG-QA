@@ -31,4 +31,6 @@ class Message(Base):
     sources: Mapped[str | None] = mapped_column(Text, nullable=True)
     # DeepSeek reasoner 等模型的推理过程（可选，仅 assistant 角色有）
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 答案状态：complete(完整) / partial(用户中断/未生成完)
+    status: Mapped[str] = mapped_column(String(20), default="complete")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
