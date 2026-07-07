@@ -53,10 +53,6 @@ dev = [
     "ragas>=0.4.3",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-norecursedirs = [".git", ".venv", "data", "models", "reference", ".codebase-memory"]
-
 # ============================================================================
 # Torch 来源：本地开发用 CUDA 版（GPU 加速），生产用 CPU 版
 # ----------------------------------------------------------------------------

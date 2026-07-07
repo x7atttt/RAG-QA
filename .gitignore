@@ -53,9 +53,6 @@ wheels/
 # Claude/zcode 配置
 .claude/
 
-# codebase-memory 索引产物（持久化图数据库，体积大，不入库）
-.codebase-memory/
-
 # 临时测试脚本（_xxx.py，正式测试在 tests/）
 test.py
 /test/
@@ -76,4 +73,3 @@ data/chroma_eval_ocr/
 
 # MinerU 解析结果缓存（OCR→RAG 端到端评测用）
 data/ocr_md_cache/
-reference/

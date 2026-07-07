@@ -30,8 +30,6 @@
     const sendBtn = document.getElementById("sendBtn");
     const statusHint = document.getElementById("statusHint");
     const thinkingToggle = document.getElementById("thinkingToggle");
-    const webSearchToggle = document.getElementById("webSearchToggle");
-    const webSearchWarning = document.getElementById("webSearchWarning");
 
     // 深度思考开关：用 localStorage 记住用户偏好
     const THINKING_KEY = "docqa_thinking";
@@ -40,42 +38,7 @@
         localStorage.setItem(THINKING_KEY, thinkingToggle.checked ? "1" : "0");
     });
 
-    // 联网搜索开关：会话级持久化（每个会话独立存储）
-    function _wsKey(convId) { return `docqa_web_search_${convId}`; }
-    function _wsWarnedKey(convId) { return `docqa_web_search_warned_${convId}`; }
-
-    function loadWebSearchToggle(convId) {
-        if (!convId) { webSearchToggle.checked = true; return; }
-        const saved = localStorage.getItem(_wsKey(convId));
-        webSearchToggle.checked = saved === null ? true : saved === "1";
-    }
-
-    function showWebSearchWarning(convId) {
-        if (!convId) return;
-        // 已警告过的会话不再弹出
-        if (localStorage.getItem(_wsWarnedKey(convId)) === "1") return;
-        webSearchWarning.style.display = "";
-        localStorage.setItem(_wsWarnedKey(convId), "1");
-    }
-
-    // 警告关闭后不再重复弹出（Bootstrap dismiss 事件）
-    webSearchWarning.addEventListener("closed.bs.alert", () => {
-        if (currentConvId) localStorage.setItem(_wsWarnedKey(currentConvId), "1");
-    });
-
-    // toggle 变化时保存到当前会话 + 检测 OFF→ON 转换
-    webSearchToggle.addEventListener("change", () => {
-        if (!currentConvId) return;
-        const prev = localStorage.getItem(_wsKey(currentConvId));
-        localStorage.setItem(_wsKey(currentConvId), webSearchToggle.checked ? "1" : "0");
-        // OFF→ON 转换时弹出警告
-        if (prev === "0" && webSearchToggle.checked) {
-            showWebSearchWarning(currentConvId);
-        }
-    });
-
     let streaming = false; // 是否正在接收流（防止并发）
-    let userStopped = false; // 用户是否主动点击停止
 
     // ---------- 会话管理 ----------
     let currentConvId = null; // 当前会话 id
@@ -137,9 +100,6 @@
             highlightConv(currentConvId);
             clearChatBox();
             closeSidebarMobile();
-            // 新建会话：默认开启联网搜索，隐藏警告
-            loadWebSearchToggle(currentConvId);
-            webSearchWarning.style.display = "none";
         } catch (err) {
             showToast(err.message, "danger");
         }
@@ -172,8 +132,6 @@
         currentConvId = id;
         highlightConv(id);
         closeSidebarMobile();
-        loadWebSearchToggle(id);
-        webSearchWarning.style.display = "none";
         chatBox.innerHTML = `<div class="text-center text-muted py-5"><div class="spinner-border spinner-border-sm"></div> 加载历史...</div>`;
         try {
             const data = await window.API.fetchJSON(
@@ -198,9 +156,6 @@
                 appendUserMsg(m.content);
             } else {
                 const { contentEl, reasoningBox, reasoningEl, sourcesArea, reasoningHint } = createAssistantMsg();
-                // 清除 createAssistantMsg 初始化的打字光标
-                const cursor = contentEl.querySelector(".typing-cursor");
-                if (cursor) cursor.remove();
                 // 渲染完整答案
                 contentEl.innerHTML = renderMarkdown(m.content);
                 contentEl.querySelectorAll("pre code").forEach((b) => {
@@ -213,21 +168,12 @@
                     reasoningBox.open = false;
                     if (reasoningHint) reasoningHint.textContent = "点击展开/收起";
                 } else {
-                    // 无推理内容则隐藏面板，重置 hint 文案
+                    // 无推理内容则隐藏面板
                     reasoningBox.style.display = "none";
-                    if (reasoningHint) reasoningHint.textContent = "点击展开/收起";
                 }
                 // 来源（如有）
                 if (m.sources && m.sources.length) {
                     renderSources(sourcesArea, m.sources);
-                    // 联网搜索可见性：历史消息也保留标记
-                    if (m.sources.some((s) => s.source === "web" || s.filename === "联网搜索结果")) {
-                        renderWebSearchBadge(sourcesArea);
-                    }
-                }
-                // 部分答案（用户中断）：显示继续按钮
-                if (m.status === "partial") {
-                    _appendContinueBtn(contentEl, sourcesArea);
                 }
             }
         });
@@ -346,15 +292,6 @@
         areaEl.innerHTML = `<span class="sources-label me-1"><i class="bi bi-quote"></i> 参考</span>${chips}`;
     }
 
-    function renderWebSearchBadge(areaEl) {
-        if (!areaEl) return;
-        // 追加联网搜索提示（不覆盖已有来源 chip）
-        const prev = areaEl.innerHTML || "";
-        const badge = `<span class="source-chip text-bg-warning"><i class="bi bi-globe2 me-1"></i>联网搜索</span>`;
-        const gap = prev ? " " : "";
-        areaEl.innerHTML = `${prev}${gap}${badge}`;
-    }
-
     // ---------- SSE 帧解析器（跨 chunk 缓冲）----------
     function createSSEParser(handlers) {
         let buffer = "";
@@ -405,10 +342,8 @@
         let fullAnswer = "";
         let fullReasoning = "";
         let reasoningDone = false; // 推理完成（收到首个 token）后自动收起面板
-        let stopped = false; // 用户主动停止后不再重建 DOM
 
         function updateContent() {
-            if (stopped) return;
             contentEl.innerHTML = renderMarkdown(fullAnswer) + `<span class="typing-cursor"></span>`;
             renderMarkdownHighlight(contentEl);
             scrollToBottom();
@@ -425,32 +360,18 @@
 
         const parser = createSSEParser({
             sources: (raw) => {
-                if (stopped) return;
                 try {
                     const arr = JSON.parse(raw);
                     renderSources(sourcesArea, arr);
                 } catch {}
                 statusHint.textContent = "正在生成回答...";
             },
-            web_search: (raw) => {
-                try {
-                    const obj = JSON.parse(raw);
-                    if (obj && obj.used) {
-                        renderWebSearchBadge(sourcesArea);
-                        if (statusHint) statusHint.textContent = "已联网搜索，正在生成回答...";
-                        // 该会话首次实际触发联网搜索时弹出警告
-                        showWebSearchWarning(currentConvId);
-                    }
-                } catch {}
-            },
             reasoning: (raw) => {
-                if (stopped) return;
                 fullReasoning += raw;
                 updateReasoning();
                 if (statusHint.textContent === "正在检索文档...") statusHint.textContent = "正在推理...";
             },
             token: (raw) => {
-                if (stopped) return;
                 // 首个正式 token 到达 → 推理阶段结束，收起推理面板，让正文成为焦点
                 if (!reasoningDone && fullAnswer === "") {
                     reasoningDone = true;
@@ -464,7 +385,6 @@
                 }
             },
             answer_final: (raw) => {
-                if (stopped) return;
                 try {
                     const obj = JSON.parse(raw);
                     if (obj && typeof obj.answer === "string") fullAnswer = obj.answer;
@@ -519,7 +439,7 @@
                     "Content-Type": "application/json",
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
-                body: JSON.stringify({ question, thinking, conversation_id: currentConvId, enable_web_search: !!webSearchToggle.checked }),
+                body: JSON.stringify({ question, thinking, conversation_id: currentConvId }),
                 signal: controller.signal,
             });
 
@@ -550,192 +470,25 @@
             if (cursor) cursor.remove();
         } catch (err) {
             clearTimeout(abortTimer);
-            const cursor = contentEl.querySelector(".typing-cursor");
-            if (cursor) cursor.remove();
             if (err.name === "AbortError") {
-                if (userStopped) {
-                    // 用户主动停止：保留已生成内容，追加继续按钮
-                    stopped = true;
-                    statusHint.textContent = "已停止";
-                    // 直接从 DOM 删除所有光标元素（不依赖 innerHTML 重建）
-                    contentEl.querySelectorAll(".typing-cursor").forEach((el) => el.remove());
-                    _appendContinueBtn(contentEl, sourcesArea);
-                } else {
-                    // 超时或离开页面
-                    const hint = document.createElement("div");
-                    hint.className = "text-muted small mt-2";
-                    hint.innerHTML = '<i class="bi bi-clock-history me-1"></i>已中断（超时或离开页面）';
-                    contentEl.appendChild(hint);
-                    statusHint.textContent = "已中断";
-                }
+                contentEl.innerHTML += `<div class="text-muted small mt-2"><i class="bi bi-clock-history me-1"></i>已中断（超时或离开页面）</div>`;
+                statusHint.textContent = "已中断";
             } else {
                 contentEl.innerHTML = `<div class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(err.message)}</div>`;
                 statusHint.textContent = "出错";
             }
         } finally {
             streaming = false;
-            // 安全兜底：流结束后确保光标被移除
-            contentEl.querySelectorAll(".typing-cursor").forEach((el) => el.remove());
             setSending(false);
-            userStopped = false;
             if (statusHint.textContent === "正在检索文档..." || statusHint.textContent === "正在生成回答..." || statusHint.textContent === "正在推理...") {
                 statusHint.textContent = "完成";
             }
         }
     }
 
-    // ---------- 继续回答 ----------
-    function _appendContinueBtn(contentEl, sourcesArea) {
-        const wrapper = document.createElement("div");
-        wrapper.className = "mt-2 continue-wrapper";
-        wrapper.innerHTML = `<span class="text-muted small me-2">⏹ 已停止</span>` +
-            `<button class="btn btn-sm btn-outline-primary continue-btn"><i class="bi bi-play-circle me-1"></i>继续回答</button>`;
-        contentEl.appendChild(wrapper);
-        wrapper.querySelector(".continue-btn").addEventListener("click", () => _doContinue(wrapper, contentEl, sourcesArea));
-    }
-
-    async function _doContinue(wrapper, contentEl, sourcesArea) {
-        if (streaming) return;
-        // 找到最近的 partial 消息 ID 和已有内容
-        let messageId, partialAnswer;
-        try {
-            const data = await window.API.fetchJSON(
-                ENDPOINTS.chat.history + `?conversation_id=${currentConvId}&limit=1`
-            );
-            const last = data.messages?.[0];
-            if (!last || last.role !== "assistant" || last.status !== "partial") {
-                wrapper.innerHTML = `<span class="text-danger small">未找到可继续的消息</span>`;
-                return;
-            }
-            messageId = last.id;
-            partialAnswer = last.content || "";
-        } catch {
-            wrapper.innerHTML = `<span class="text-danger small">获取消息失败</span>`;
-            return;
-        }
-
-        // 开始续写
-        streaming = true;
-        userStopped = false;
-        setSending(true);
-        statusHint.textContent = "继续回答中...";
-        const thinking = thinkingToggle.checked;
-
-        // 移除继续按钮，用 markdown 容器替换内容（避免 innerHTML 反复重建）
-        wrapper.remove();
-        const mdDiv = document.createElement("div");
-        contentEl.appendChild(mdDiv);
-        mdDiv.innerHTML = renderMarkdown(partialAnswer);
-        renderMarkdownHighlight(mdDiv);
-        // 用独立 span 做光标，token 追加时只操作 span
-        const cursor = document.createElement("span");
-        cursor.className = "typing-cursor";
-        contentEl.appendChild(cursor);
-
-        const controller = new AbortController();
-        let abortTimer;
-        const resetAbortTimer = () => {
-            clearTimeout(abortTimer);
-            abortTimer = setTimeout(() => controller.abort(), 60000);
-        };
-        window._chatAbortController = controller;
-
-        const parser = createSSEParser({
-            reasoning: (raw) => {
-                const reasoningEl = contentEl.closest(".assistant-row")?.querySelector(".reasoning-pre");
-                if (reasoningEl) reasoningEl.textContent += raw;
-            },
-            token: (raw) => {
-                // 把新 token 转 markdown 后 append 到 mdDiv，光标不动
-                const chunk = renderMarkdown(raw);
-                cursor.insertAdjacentHTML("beforebegin", chunk);
-                scrollToBottom();
-            },
-            answer_final: (raw) => {
-                try {
-                    const obj = JSON.parse(raw);
-                    if (obj && typeof obj.answer === "string") {
-                        mdDiv.innerHTML = renderMarkdown(obj.answer);
-                        renderMarkdownHighlight(mdDiv);
-                    }
-                } catch {}
-            },
-            done: () => {
-                statusHint.textContent = "完成";
-            },
-            error: (raw) => {
-                let msg = "续写失败";
-                try { msg = JSON.parse(raw).message || msg; } catch {}
-                contentEl.innerHTML += `<div class="text-danger small mt-2">${escapeHtml(msg)}</div>`;
-                statusHint.textContent = "出错";
-            },
-        });
-
-        try {
-            const token_jwt = Token.get();
-            const resp = await fetch(ENDPOINTS.chat.continue, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    ...(token_jwt ? { Authorization: `Bearer ${token_jwt}` } : {}),
-                },
-                body: JSON.stringify({ message_id: messageId, conversation_id: currentConvId, thinking }),
-                signal: controller.signal,
-            });
-
-            if (resp.status === 401) {
-                Token.clear();
-                location.href = "/login.html";
-                return;
-            }
-            if (!resp.ok) {
-                const payload = await resp.json().catch(() => null);
-                throw new Error(payload?.message || `请求失败 (HTTP ${resp.status})`);
-            }
-
-            const reader = resp.body.getReader();
-            const decoder = new TextDecoder();
-            resetAbortTimer();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                resetAbortTimer();
-                parser.feed(decoder.decode(value, { stream: true }));
-            }
-            clearTimeout(abortTimer);
-            parser.flush();
-        } catch (err) {
-            clearTimeout(abortTimer);
-            if (err.name === "AbortError") {
-                if (userStopped) {
-                    statusHint.textContent = "已停止";
-                    _appendContinueBtn(contentEl, sourcesArea);
-                } else {
-                    contentEl.innerHTML += `<div class="text-muted small mt-2"><i class="bi bi-clock-history me-1"></i>已中断</div>`;
-                    statusHint.textContent = "已中断";
-                }
-            } else {
-                contentEl.innerHTML += `<div class="text-danger small mt-2"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(err.message)}</div>`;
-                statusHint.textContent = "出错";
-            }
-        } finally {
-            streaming = false;
-            userStopped = false;
-            setSending(false);
-        }
-    }
-
     function setSending(sending) {
+        sendBtn.disabled = sending;
         questionInput.disabled = sending;
-        if (sending) {
-            sendBtn.type = "button";
-            sendBtn.className = "btn btn-outline-danger px-4";
-            sendBtn.innerHTML = '<i class="bi bi-stop-circle"></i> 停止';
-        } else {
-            sendBtn.type = "submit";
-            sendBtn.className = "btn btn-primary px-4";
-            sendBtn.innerHTML = '<i class="bi bi-send"></i> 发送';
-        }
         if (!sending) questionInput.focus();
     }
 
@@ -747,14 +500,6 @@
         questionInput.value = "";
         autoResize();
         ask(q);
-    });
-
-    sendBtn.addEventListener("click", (e) => {
-        if (streaming) {
-            e.preventDefault();
-            userStopped = true;
-            window._chatAbortController?.abort();
-        }
     });
 
     questionInput.addEventListener("keydown", (e) => {

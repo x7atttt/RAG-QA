@@ -21,7 +21,6 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 - [🧠 会话记忆](#-会话记忆)
 - [♻️ 文档增量更新](#-文档增量更新)
 - [🔄 CRAG 循环重查](#-crag-循环重查)
-- [🛠 工具调用](#-工具调用)
 - [🔍 检索与评测](#-检索与评测)
 - [🚀 快速开始](#-快速开始)
 - [📡 API 概览](#-api-概览)
@@ -41,11 +40,9 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | 🔍 **RAG 检索增强** | BGE-M3 向量检索（dense+sparse RRF 混合召回）+ BGE-Reranker-v2-M3 交叉编码器精排 |
 | 🤖 **LangGraph Agent** | 状态图编排"意图判断 → query 改写 → 检索 → 生成"链路，意图路由按需检索 |
 | 🔄 **CRAG 循环重查** | Corrective RAG：检索相关度低时改写 query 变体重检索（条件回边循环），仍低才降级，解决 query 表述与文档不一致 |
-| 🛠 **工具调用** | 双路径工具调用：CRAG 仍低相关时规则触发 Tavily 联网搜索兜底；文档元信息问题（如"我上传过哪些 PDF"）由 tool_router 决策调用元信息查询工具 |
 | 💬 **多会话管理** | 侧边栏会话列表，新建/切换/删除，每用户上限 10 个，首问自动生成标题 |
 | 💡 **深度思考模式** | DeepSeek thinking 开关，显式控制思考模式启停，推理过程可折叠查看 |
 | ⚡ **SSE 流式输出** | Server-Sent Events 实时打字机效果，推理面板自动展开、答案逐字呈现 |
-| ⏹ **对话中断与继续** | 流式回答中可随时停止，部分答案持久化（status 标记）；对中断消息可"继续回答"从断点续写，`asyncio.shield` 保护断连后数据不丢 |
 | 🧠 **智能降级回答** | 检索低相关/无命中时降级为「文档背景 + 常识」回答，泛化问题（如「怎么改进简历」）不再硬拒绝 |
 | 🔁 **多轮上下文 + query 改写** | 保留会话最近若干轮历史（token 预算 + 轮数双约束截断，替代固定条数），检索前 LLM 改写指代词（"它""第三条"→ 完整问题），解决多轮指代检索失效 |
 | 🧠 **长期记忆：会话摘要** | 长对话达阈值轮数后异步压缩老对话成摘要，注入 system prompt（"摘要 + 近期原文"混合上下文，Dify/FastGPT 同款），解决深挖文档时早期上下文丢失 |
@@ -67,7 +64,6 @@ FastAPI · LangGraph · ChromaDB · DeepSeek · Redis · BGE-M3
 | **后端** | FastAPI · LangGraph · SQLAlchemy · Pydantic v2 |
 | **RAG** | ChromaDB · FlagEmbedding（BGE-M3 稠密+稀疏向量 / BGE-Reranker-v2-M3 精排）|
 | **LLM** | DeepSeek（OpenAI SDK 直连，兼容 OpenAI 格式，reasoning_content 自取）|
-| **工具调用** | Tavily Search（联网搜索兜底）· SQLAlchemy 文档元信息查询 |
 | **解析** | MinerU 云 API（PDF: OCR/表格/公式/图片，失败回退 pymupdf4llm）· MarkItDown（DOCX）|
 | **分块** | langchain-text-splitters（MarkdownHeader / RecursiveCharacter）|
 | **缓存/限流** | Redis · slowapi |
@@ -201,46 +197,18 @@ removed（消失块）→ delete
 从线性 RAG 升级为 Corrective RAG（带循环的状态图）：检索结果相关度低时，改写 query 变体重新检索，仍低才走降级回答。
 
 ```
-检索 → 评分（reranker 归一化 top score，0~1）
+检索 → 评分（rerank top score）
   → score≥0.5 → 严格 RAG 生成
   → score<0.5 且未达重查上限 → transform_query 改写变体 → 回检索（重查）
   → score<0.5 且达上限 → fallback 降级（文档背景 + 常识）
 ```
 
 - **transform_query ≠ rewrite_query**：rewrite 消解指代（基于历史），transform 基于"检索结果差"做同义词/换角度扩展（基于弱命中片段），仅重查触发
-- **触发信号 = reranker 分**：grade_documents 读的 `top_score` 就是 reranker（cross-encoder）的归一化精排分（`compute_score(normalize=True)`），不是 dense 余弦相似度——reranker 是专门训练的相关度模型，分数校准稳定，0.5 固定阈值才有跨 query 可比性；且这个分本来就要算（精排 Top-3），触发判断零额外开销
 - **LangGraph 条件回边**：retrieve→grade→transform→retrieve 循环，从线性状态图升级为带循环的状态图
 - **静默重查**：不推 status 事件，循环结束后只推送一次 sources（避免前端弱结果→好结果闪烁）
 - **延迟取舍**：重查多 2 次 LLM 调用（首字 5s→9s），但只在低相关时触发，高频问题不受影响
 
 > 实现见 [`app/agent/nodes.py`](app/agent/nodes.py) 的 `transform_query` + `grade_documents`，编排见 [`app/services/chat_service.py`](app/services/chat_service.py)，测试见 [`tests/test_crag.py`](tests/test_crag.py)。
-
----
-
-## 🛠 工具调用
-
-工具调用用于补足 RAG 主链路答不了的两类问题：
-
-1. **知识库无相关内容**：CRAG 重查后仍低相关时，规则触发 Tavily 联网搜索作为外部信息源，避免只靠 LLM 常识 fallback；
-2. **文档元信息问题**：用户问"我上传过哪些 PDF""最近一周加了什么文档"时，答案不在 chunk 内容里，而在数据库元信息里，由 `tool_router` 判断后调用元信息查询工具。
-
-```
-intent_router
-  ├─ should_retrieve=False → 纯对话
-  └─ should_retrieve=True
-       ↓
-     tool_router（LLM 判断是否为文档元信息问题）
-       ├─ doc_meta → 查询 Document 表 → 生成回答
-       ├─ web_search（显式命令，如“用联网搜索查一下”）→ 直接联网搜索
-       └─ None → rewrite_query → retrieve → CRAG
-                                  └─ 仍低相关且 ENABLE_WEB_SEARCH=true → Tavily 搜索 → 生成回答
-```
-
-- **混合触发策略**：联网搜索支持两条触发路径——① 显式命令触发（用户明确要求联网搜索时直接调用 Tavily）；② 隐式规则触发（CRAG 失败后仍低相关时作为兜底）
-- **不引入 ToolNode**：保留 `chat_service.stream_graph` 手动编排，避免回到 `graph.astream_events`（OpenAI SDK 直连后该事件不触发）
-- **默认关闭联网搜索**：`ENABLE_WEB_SEARCH=false` 时行为同改造前；需要 Tavily 时配置 `TAVILY_API_KEY`
-- **实现位置**：`app/services/tools/web_search.py`、`app/services/tools/doc_meta.py`、`app/agent/nodes.py::tool_router`、`app/services/chat_service.py::_try_web_search/_run_doc_meta`
-- **测试**：`tests/test_tool_calling.py`
 
 ---
 
@@ -334,11 +302,6 @@ MAX_CONVERSATIONS=10
 # HISTORY_TOKEN_BUDGET=3500     # 历史的 token 预算上限（仅历史部分）
 # SUMMARIZE_ROUND_THRESHOLD=12  # 累计轮数达此值触发会话摘要
 # HISTORY_CACHE_TTL_SECONDS=7200 # 历史缓存 TTL（秒）
-
-# 工具调用（可选：联网搜索兜底）
-ENABLE_WEB_SEARCH=false
-TAVILY_API_KEY=
-TAVILY_MAX_RESULTS=3
 ```
 
 > 💡 **深度思考**：前端对话页有"深度思考"开关，开启后通过 DeepSeek `thinking` 模式输出推理过程（可折叠查看）。关闭时显式禁用思考模式（`deepseek-v4-flash` 默认开启思考，需显式 disabled），确保开关真正生效。这是请求级开关，无需配置。
@@ -400,7 +363,6 @@ uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ```
 event: sources        data: [<来源卡片>]        # 检索结果，token 之前最多发一次
-event: web_search     data: {"used":true,"query":...,"preview":...}   # 联网搜索可见性标记（仅在 CRAG 失败且联网搜索触发时）
 event: reasoning      data: <裸字符串>          # 推理过程增量（thinking 模式开启时）
 event: token          data: <裸字符串>          # LLM 正式答案增量，逐字推送
 event: answer_final   data: {"answer":...,"reasoning":...}  # 完整答案与推理
