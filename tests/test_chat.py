@@ -14,6 +14,12 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _create_conversation(client, token: str) -> int:
+    resp = await client.post("/api/chat/conversations", headers=_auth(token))
+    assert resp.status_code == 200
+    return resp.json()["data"]["id"]
+
+
 @pytest.mark.asyncio
 async def test_ask_unauthenticated(client):
     resp = await client.post("/api/chat/ask", json={"question": "hi"})
@@ -45,14 +51,15 @@ async def test_general_chat_no_docs(client):
 @pytest.mark.asyncio
 async def test_history_pagination(client):
     token = await _register_and_login(client)
+    conversation_id = await _create_conversation(client, token)
     for i in range(3):
         await client.post(
             "/api/chat/ask",
-            json={"question": f"第 {i} 个独立问题 {i}"},
+            json={"question": f"第 {i} 个独立问题 {i}", "conversation_id": conversation_id},
             headers=_auth(token),
         )
 
-    resp = await client.get("/api/chat/history?limit=2", headers=_auth(token))
+    resp = await client.get(f"/api/chat/history?conversation_id={conversation_id}&limit=2", headers=_auth(token))
     assert resp.status_code == 200
     data = resp.json()["data"]
     assert len(data["messages"]) == 2
@@ -75,13 +82,15 @@ async def test_cache_hit_on_same_question(client):
 async def test_history_user_isolation(client):
     token_a = await _register_and_login(client, "isoA", "secret123")
     token_b = await _register_and_login(client, "isoB", "secret123")
+    conv_a = await _create_conversation(client, token_a)
+    conv_b = await _create_conversation(client, token_b)
 
     await client.post(
         "/api/chat/ask",
-        json={"question": "这是用户A的私有消息"},
+        json={"question": "这是用户A的私有消息", "conversation_id": conv_a},
         headers=_auth(token_a),
     )
 
-    resp_b = await client.get("/api/chat/history", headers=_auth(token_b))
+    resp_b = await client.get(f"/api/chat/history?conversation_id={conv_b}", headers=_auth(token_b))
     assert resp_b.status_code == 200
     assert len(resp_b.json()["data"]["messages"]) == 0
