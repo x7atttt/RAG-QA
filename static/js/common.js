@@ -41,6 +41,7 @@
         },
         chat: {
             ask: "/api/chat/ask",
+            continue: "/api/chat/continue",
             history: "/api/chat/history",
             conversations: "/api/chat/conversations",
             deleteConversation: (id) => `/api/chat/conversations/${id}`,
