@@ -1,3 +1,6 @@
+import json
+import re
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agent.memory import truncate_by_token_budget
@@ -43,6 +46,89 @@ async def intent_router(state: AgentState) -> AgentState:
     except Exception:
         state["should_retrieve"] = True
     return state
+
+
+async def tool_router(state: AgentState) -> AgentState:
+    """工具路由（spec/20260706-tool-calling.md 决策 3）：判断是否调文档元信息工具。
+
+    定位：串在 intent_router 之后。intent_router 判"要不要检索"（内容层），
+    tool_router 判"是不是元信息问题"（元层）。两者职责分离，每节点一件事。
+
+    元层问题示例：
+      - "我上传过哪些文档/PDF/Markdown"
+      - "最近一周加了什么文件"
+      - "哪份文档最长/最大"
+    这类问题的答案不在 chunk 里（检索失效），而在文档元数据里。
+
+    输出（写入 state）：
+      tool_call = "doc_meta"：调文档元信息工具，跳过检索链路
+      tool_call = None：不调工具，走后续检索/对话
+      doc_meta_intent = "list" | "recent"：工具查询意图
+    """
+    question = state["question"]
+
+    # 显式联网搜索命令优先：用户已经明确要求联网查询时，不等 CRAG 失败再触发
+    if _is_explicit_web_search_command(question):
+        state["tool_call"] = "web_search"
+        return state
+
+    try:
+        messages = [
+            SystemMessage(
+                content=(
+                    "判断用户问题是否在询问【文档元信息】（关于文档本身的事实，而非文档内容）。\n"
+                    "判断为是的示例：\n"
+                    "- 我上传过哪些文档/PDF/Markdown/Word\n"
+                    "- 最近一周/今天加了什么文件\n"
+                    "- 哪份文档最长/最大/最旧\n"
+                    "- 一共有多少份文档\n"
+                    "判断为否的示例（这些是内容问题，走检索）：\n"
+                    "- 文档里讲了什么 / 总结一下 / 第三条是什么\n"
+                    "- 加密方案是什么 / 有没有提到 X\n"
+                    "只输出一行 JSON：\n"
+                    '  调工具：{"call": true, "intent": "list"}（或 "intent": "recent"，'
+                    '"recent" 用于含"最近/今天/本周"等时间限定的问题）\n'
+                    '  不调工具：{"call": false}'
+                )
+            ),
+            HumanMessage(content=f"问题：{question}"),
+        ]
+        resp = await chat(messages, max_tokens=50)
+
+        # 容错：LLM 可能输出多余文本，取第一个 JSON 对象
+        resp = resp.strip()
+        start, end = resp.find("{"), resp.rfind("}")
+        if start == -1 or end == -1:
+            decision = {"call": False}
+        else:
+            decision = json.loads(resp[start : end + 1])
+
+        if decision.get("call") is True:
+            state["tool_call"] = "doc_meta"
+            state["doc_meta_intent"] = decision.get("intent", "list")
+        else:
+            state["tool_call"] = None
+    except Exception:
+        # 决策失败不阻断——降级走检索链路（顶多答得不准，不会崩）
+        state["tool_call"] = None
+    return state
+
+
+_EXPLICIT_WEB_SEARCH_RE = re.compile(
+    r"(联网|上网|在线|最新|新闻|刚刚|今天|昨天|目前|现在|实时)"
+    r"(搜|查|搜一下|查一下|搜索一下|查一下|查找)?",
+    re.IGNORECASE,
+)
+
+
+def _is_explicit_web_search_command(text: str) -> bool:
+    """判断用户输入是否为显式联网搜索命令。
+
+    优先级高于 tool_router 的 LLM 决策：
+    用户已经明确表达“联网搜索/在线查/查最新消息”，应直接触发 web_search，
+    不必等到 CRAG 失败后才作为兜底。
+    """
+    return bool(_EXPLICIT_WEB_SEARCH_RE.search(text or ""))
 
 
 async def rewrite_query(state: AgentState) -> AgentState:
@@ -321,6 +407,68 @@ def _build_fallback_prompt(
         "4) 简洁专业，中文回答。"
     )
     user = f"文档背景：\n{context}\n\n用户问题：{question}"
+    messages = [SystemMessage(content=system)]
+    if history:
+        messages.extend(_history_to_messages(history))
+    messages.append(HumanMessage(content=user))
+    return _inject_summary(messages, summary)
+
+
+def _build_web_search_prompt(
+    question: str,
+    web_context: str,
+    fallback_docs: list[str] | None = None,
+    history: list[dict] | None = None,
+    summary: str | None = None,
+) -> list:
+    """联网搜索结果作为主 context 的 prompt（spec/20260706 决策 5）。
+
+    触发场景：CRAG 重查仍失败 → 知识库无相关内容 → 调 Tavily 搜网络兜底。
+    与 _build_fallback_prompt 的区别：fallback 凭常识 + 残余弱命中片段作答（易幻觉），
+    本 prompt 用真实的网络检索结果作为事实依据，降低幻觉。
+
+    来源标注由 system prompt 强制：网络结果 vs 残余文档片段分开说明。
+    """
+    fallback_part = (
+        f"\n\n参考文档（弱相关）：\n{'---'.join(fallback_docs)}"
+        if fallback_docs
+        else ""
+    )
+    system = (
+        "你是一个智能助手。用户的知识库中没有直接回答该问题的内容，已通过联网搜索获取了以下资料。\n"
+        "请基于联网搜索结果回答用户问题：\n"
+        "1) 答案必须基于搜索结果，不要编造未在结果中出现的信息；\n"
+        "2) 回答开头标注『以下内容来自网络搜索，非您上传的文档』；\n"
+        "3) 引用具体来源时附上对应链接；\n"
+        "4) 搜索结果不足时坦诚说明，不强行编造。"
+    )
+    user = f"联网搜索结果：\n{web_context}{fallback_part}\n\n用户问题：{question}"
+    messages = [SystemMessage(content=system)]
+    if history:
+        messages.extend(_history_to_messages(history))
+    messages.append(HumanMessage(content=user))
+    return _inject_summary(messages, summary)
+
+
+def _build_doc_meta_prompt(
+    question: str,
+    doc_meta_context: str,
+    history: list[dict] | None = None,
+    summary: str | None = None,
+) -> list:
+    """文档元信息工具结果的 prompt。
+
+    触发场景：tool_router 判定问题为元层问题（"我有哪些文档"）→ 调 doc_meta 工具 →
+    用本 prompt 把工具返回的元信息列表喂给 LLM 生成自然语言回答。
+    """
+    system = (
+        "你是一个智能助手。系统已根据用户问题查询了其上传文档的元信息。\n"
+        "请基于以下元信息，用自然语言回答用户问题：\n"
+        "1) 直接回答用户问的（数量/文件名/时间等），不要展开文档内容；\n"
+        "2) 信息以列表形式呈现时保持清晰可读；\n"
+        "3) 简洁专业，中文回答。"
+    )
+    user = f"文档元信息：\n{doc_meta_context}\n\n用户问题：{question}"
     messages = [SystemMessage(content=system)]
     if history:
         messages.extend(_history_to_messages(history))

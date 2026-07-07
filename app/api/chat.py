@@ -24,6 +24,7 @@ from app.core.response import ResponseCode, success_response
 from app.models import Conversation, Message, User
 from app.schemas.chat import (
     ChatAskRequest,
+    ChatContinueRequest,
     ChatHistoryData,
     ConversationListData,
     ConversationOut,
@@ -107,10 +108,11 @@ async def ask(
         reasoning_parts: list[str] = []
         sources: list[dict] = []
         error_msg: str | None = None
+        partial = False
 
         try:
             async for event_name, payload in stream_graph(
-                graph, user_id, question, history, thinking, summary
+                graph, user_id, question, history, thinking, summary, enable_web_search=bool(getattr(body, 'enable_web_search', True))
             ):
                 yield sse(event_name, payload)
                 if event_name == "token":
@@ -129,29 +131,185 @@ async def ask(
                 elif event_name == "error":
                     error_msg = payload.get("message", "未知错误")
         except asyncio.CancelledError:
+            partial = True
             raise
         finally:
-            await asyncio.shield(
-                _finalize(
-                    user_id=user_id,
-                    question=question,
-                    answer_parts=answer_parts,
-                    reasoning_parts=reasoning_parts,
-                    sources=sources,
-                    error_msg=error_msg,
-                    lock_token=lock_token,
-                    background_tasks=background_tasks,
-                    thinking=thinking,
-                    conversation_id=conversation_id,
-                    history_version=hver,
-                )
+            # partial 时必须同步等待落库（shield 在 generator 退出后任务会被取消）；
+            # 完整回答用 shield 异步不阻塞。
+            coro = _finalize(
+                user_id=user_id,
+                question=question,
+                answer_parts=answer_parts,
+                reasoning_parts=reasoning_parts,
+                sources=sources,
+                error_msg=error_msg,
+                lock_token=lock_token,
+                background_tasks=background_tasks,
+                thinking=thinking,
+                conversation_id=conversation_id,
+                history_version=hver,
+                is_partial=partial,
             )
+            if partial:
+                await coro
+            else:
+                await asyncio.shield(coro)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/continue")
+@limiter.limit("100/minute")
+async def continue_answer(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: ChatContinueRequest,
+    user: User = Depends(get_current_user),
+):
+    """继续回答被中断的 partial 消息。
+
+    流程：加载 partial 消息 → 构造续写 prompt → astream_chat 流式续写 → UPDATE 合并。
+    """
+    graph = request.app.state.graph
+
+    # 1. 加载 partial 消息，校验归属
+    async with async_session_factory() as db:
+        msg = await db.get(Message, body.message_id)
+        if not msg or msg.conversation_id != body.conversation_id:
+            raise BizError(code=ResponseCode.CONVERSATION_NOT_FOUND, message="消息不存在", http_status=404)
+        conv = await db.get(Conversation, body.conversation_id)
+        if not conv or conv.user_id != user.id:
+            raise BizError(code=ResponseCode.CONVERSATION_NOT_FOUND, message="会话不存在", http_status=404)
+        if msg.status != "partial":
+            raise BizError(code=ResponseCode.BAD_REQUEST, message="该消息非中断状态，无需继续", http_status=400)
+        partial_answer = msg.content
+        partial_reasoning = msg.reasoning or ""
+        # 从 sources JSON 反推原始来源类型
+        raw_sources = msg.sources
+        existing_sources: list[dict] = json.loads(raw_sources) if raw_sources else []
+
+    # 2. 取历史 + 摘要（与 ask 一致）
+    user_id = user.id
+    conversation_id = body.conversation_id
+    thinking = bool(body.thinking)
+    history = await _load_recent_history(user_id, conversation_id)
+    summary = await _load_summary(conversation_id)
+
+    # 3. 找到原始问题（partial 消息的前一条 user 消息）
+    async with async_session_factory() as db:
+        prev_msg = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id, Message.role == "user", Message.id < body.message_id)
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        user_msg = prev_msg.scalar_one_or_none()
+    if not user_msg:
+        raise BizError(code=ResponseCode.BAD_REQUEST, message="找不到对应的问题", http_status=400)
+    question = user_msg.content
+
+    # 4. 构造续写 prompt：history + 问题 + 部分答案 + 续写指令
+    from app.agent.nodes import _history_to_messages, _inject_summary
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    system = (
+        "你是文档问答助手。请继续回答用户的问题。\n"
+        "要求：1) 从上一条回答的断点处无缝续写，不要重复已有内容；\n"
+        "2) 保持风格和语气一致；3) 简洁专业，中文回答。"
+    )
+    messages = [SystemMessage(content=system)]
+    if history:
+        messages.extend(_history_to_messages(history))
+    messages = _inject_summary(messages, summary)
+    messages.append(HumanMessage(content=question))
+    messages.append(AIMessage(content=partial_answer))
+    messages.append(HumanMessage(content="请继续上面的回答，从断点处无缝续写，不要重复已有内容。"))
+
+    # 5. 流式续写 + 实时推送
+    from app.services.llm_provider import astream_chat
+
+    cont_answer_parts: list[str] = []
+    cont_reasoning_parts: list[str] = []
+
+    async def continue_stream():
+        nonlocal cont_answer_parts, cont_reasoning_parts
+        partial_inner = False
+        try:
+            async for event, text in astream_chat(messages, thinking=thinking):
+                if event == "reasoning":
+                    cont_reasoning_parts.append(text)
+                    yield sse("reasoning", text)
+                elif event == "content":
+                    cont_answer_parts.append(text)
+                    yield sse("token", text)
+            # 续写完成：合并到原 message
+            full_answer = partial_answer + "".join(cont_answer_parts)
+            full_reasoning = partial_reasoning + "".join(cont_reasoning_parts) if (partial_reasoning or cont_reasoning_parts) else ""
+            await _merge_continuation(
+                message_id=body.message_id,
+                conversation_id=conversation_id,
+                full_answer=full_answer,
+                full_reasoning=full_reasoning,
+                sources=existing_sources,
+                background_tasks=background_tasks,
+            )
+            yield sse("answer_final", {"answer": full_answer, "reasoning": full_reasoning})
+            yield sse("done", {"status": "ok"})
+        except asyncio.CancelledError:
+            partial_inner = True
+            # 再次中断：合并已续写部分，仍标记 partial
+            if cont_answer_parts:
+                merged = partial_answer + "".join(cont_answer_parts)
+                merged_reasoning = partial_reasoning + "".join(cont_reasoning_parts) if cont_reasoning_parts else partial_reasoning
+                await _merge_continuation(
+                    message_id=body.message_id,
+                    conversation_id=conversation_id,
+                    full_answer=merged,
+                    full_reasoning=merged_reasoning,
+                    sources=existing_sources,
+                    background_tasks=background_tasks,
+                    is_partial=True,
+                )
+            raise
+        except Exception as e:
+            yield sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        continue_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _merge_continuation(
+    message_id: int,
+    conversation_id: int,
+    full_answer: str,
+    full_reasoning: str,
+    sources: list[dict],
+    background_tasks: BackgroundTasks | None = None,
+    is_partial: bool = False,
+) -> None:
+    """续写完成后 UPDATE 原 message：合并内容，status → complete（或保持 partial）。"""
+    try:
+        async with async_session_factory() as db:
+            msg = await db.get(Message, message_id)
+            if msg:
+                msg.content = full_answer
+                msg.reasoning = full_reasoning or None
+                msg.sources = json.dumps(sources, ensure_ascii=False) if sources else None
+                msg.status = "partial" if is_partial else "complete"
+                await db.commit()
+            await invalidate_history_cache(conversation_id)
+            if background_tasks is not None and not is_partial:
+                from app.services.summary_service import maybe_generate_summary
+                background_tasks.add_task(maybe_generate_summary, conversation_id)
+    except Exception:
+        pass
 
 
 async def _load_recent_history(
@@ -236,6 +394,7 @@ async def _finalize(
     thinking: bool = False,
     conversation_id: int | None = None,
     history_version: int = 0,
+    is_partial: bool = False,
 ) -> None:
     answer = "".join(answer_parts)
     reasoning = "".join(reasoning_parts) if reasoning_parts else ""
@@ -279,6 +438,7 @@ async def _finalize(
                     content=answer,
                     sources=json.dumps(sources, ensure_ascii=False) if sources else None,
                     reasoning=reasoning or None,
+                    status="partial" if is_partial else "complete",
                 )
             )
             await db.commit()
@@ -338,6 +498,7 @@ async def history(
                 content=m.content,
                 sources=sources_list,
                 reasoning=m.reasoning,
+                status=m.status or "complete",
                 created_at=m.created_at,
             )
         )

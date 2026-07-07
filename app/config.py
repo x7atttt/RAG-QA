@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # 轮询总超时（秒），超时自动回退 pymupdf4llm
     mineru_timeout: int = 180
 
+    # ============ 工具调用 ============
+    # 联网搜索（Tavily）：CRAG 重查仍失败时的兜底信息源。
+    tavily_api_key: str = ""
+    # Tavily 单次搜索返回的片段数（喂给 LLM 的 context 量上限）
+    tavily_max_results: int = 3
+
 
 @lru_cache
 def get_settings() -> Settings:

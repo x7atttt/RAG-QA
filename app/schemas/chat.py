@@ -10,6 +10,15 @@ class ChatAskRequest(BaseModel):
     thinking: bool = False
     # 指定会话继续对话；为空则后端自动新建会话
     conversation_id: int | None = None
+    # 用户级联网搜索开关：默认开启，用户可手动关闭；显式联网搜索命令仍受此开关约束
+    enable_web_search: bool = True
+
+
+class ChatContinueRequest(BaseModel):
+    """继续回答被中断的 partial 消息。"""
+    message_id: int
+    conversation_id: int
+    thinking: bool = False
 
 
 class SourceItem(BaseModel):
@@ -28,6 +37,7 @@ class MessageOut(BaseModel):
     content: str
     sources: list[SourceItem] = []
     reasoning: str | None = None
+    status: str = "complete"
     created_at: datetime | None = None
 
 

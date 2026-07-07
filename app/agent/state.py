@@ -26,6 +26,15 @@ class AgentState(TypedDict, total=False):
     retrieval_attempts: int
     # 意图路由
     should_retrieve: bool
+    # 工具路由（spec/20260706-tool-calling.md）：tool_router 决策是否调文档元信息工具
+    # None=不调工具走检索/对话；"doc_meta"=调文档元信息工具
+    tool_call: str | None
+    # 文档元信息工具的查询意图（tool_router 提取）：list / recent
+    doc_meta_intent: str
+    # 文档元信息工具返回结果（format_for_prompt 后的文本）
+    doc_meta_result: str
+    # 联网搜索工具返回结果（format_for_prompt 后的文本）；非空时进 _build_web_search_prompt
+    web_search_result: str
     # 检索
     retrieved_docs: list[str]
     sources: list[SourceItem]
