@@ -30,6 +30,8 @@
     const sendBtn = document.getElementById("sendBtn");
     const statusHint = document.getElementById("statusHint");
     const thinkingToggle = document.getElementById("thinkingToggle");
+    const webSearchToggle = document.getElementById("webSearchToggle");
+    const webSearchWarning = document.getElementById("webSearchWarning");
 
     // 深度思考开关：用 localStorage 记住用户偏好
     const THINKING_KEY = "docqa_thinking";
@@ -38,7 +40,38 @@
         localStorage.setItem(THINKING_KEY, thinkingToggle.checked ? "1" : "0");
     });
 
+    // 联网搜索开关：会话级持久化（每个会话独立存储）
+    function _wsKey(convId) { return `docqa_web_search_${convId}`; }
+    function _wsWarnedKey(convId) { return `docqa_web_search_warned_${convId}`; }
+
+    function loadWebSearchToggle(convId) {
+        if (!convId) { webSearchToggle.checked = true; return; }
+        const saved = localStorage.getItem(_wsKey(convId));
+        webSearchToggle.checked = saved === null ? true : saved === "1";
+    }
+
+    function showWebSearchWarning(convId) {
+        if (!convId) return;
+        if (localStorage.getItem(_wsWarnedKey(convId)) === "1") return;
+        webSearchWarning.style.display = "";
+        localStorage.setItem(_wsWarnedKey(convId), "1");
+    }
+
+    webSearchWarning.addEventListener("closed.bs.alert", () => {
+        if (currentConvId) localStorage.setItem(_wsWarnedKey(currentConvId), "1");
+    });
+
+    webSearchToggle.addEventListener("change", () => {
+        if (!currentConvId) return;
+        const prev = localStorage.getItem(_wsKey(currentConvId));
+        localStorage.setItem(_wsKey(currentConvId), webSearchToggle.checked ? "1" : "0");
+        if (prev === "0" && webSearchToggle.checked) {
+            showWebSearchWarning(currentConvId);
+        }
+    });
+
     let streaming = false; // 是否正在接收流（防止并发）
+    let userStopped = false; // 用户是否主动点击停止
 
     // ---------- 会话管理 ----------
     let currentConvId = null; // 当前会话 id
@@ -100,6 +133,9 @@
             highlightConv(currentConvId);
             clearChatBox();
             closeSidebarMobile();
+            // 新建会话：默认开启联网搜索，隐藏警告
+            loadWebSearchToggle(currentConvId);
+            webSearchWarning.style.display = "none";
         } catch (err) {
             showToast(err.message, "danger");
         }
@@ -130,6 +166,7 @@
             return;
         }
         currentConvId = id;
+        loadWebSearchToggle(id);
         highlightConv(id);
         closeSidebarMobile();
         chatBox.innerHTML = `<div class="text-center text-muted py-5"><div class="spinner-border spinner-border-sm"></div> 加载历史...</div>`;
@@ -174,6 +211,10 @@
                 // 来源（如有）
                 if (m.sources && m.sources.length) {
                     renderSources(sourcesArea, m.sources);
+                    // 联网搜索可见性：历史消息也保留标记
+                    if (m.sources.some((s) => s.source === "web" || s.filename === "联网搜索结果")) {
+                        renderWebSearchBadge(sourcesArea);
+                    }
                 }
             }
         });
@@ -292,6 +333,14 @@
         areaEl.innerHTML = `<span class="sources-label me-1"><i class="bi bi-quote"></i> 参考</span>${chips}`;
     }
 
+    function renderWebSearchBadge(areaEl) {
+        if (!areaEl) return;
+        const prev = areaEl.innerHTML || "";
+        const badge = `<span class="source-chip text-bg-warning"><i class="bi bi-globe2 me-1"></i>联网搜索</span>`;
+        const gap = prev ? " " : "";
+        areaEl.innerHTML = `${prev}${gap}${badge}`;
+    }
+
     // ---------- SSE 帧解析器（跨 chunk 缓冲）----------
     function createSSEParser(handlers) {
         let buffer = "";
@@ -366,6 +415,16 @@
                 } catch {}
                 statusHint.textContent = "正在生成回答...";
             },
+            web_search: (raw) => {
+                try {
+                    const obj = JSON.parse(raw);
+                    if (obj && obj.used) {
+                        renderWebSearchBadge(sourcesArea);
+                        if (statusHint) statusHint.textContent = "已联网搜索，正在生成回答...";
+                        showWebSearchWarning(currentConvId);
+                    }
+                } catch {}
+            },
             reasoning: (raw) => {
                 fullReasoning += raw;
                 updateReasoning();
@@ -439,7 +498,7 @@
                     "Content-Type": "application/json",
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
-                body: JSON.stringify({ question, thinking, conversation_id: currentConvId }),
+                body: JSON.stringify({ question, thinking, conversation_id: currentConvId, enable_web_search: !!webSearchToggle.checked }),
                 signal: controller.signal,
             });
 
