@@ -536,24 +536,6 @@ h1, h2, h3,
     font-weight: 500;
 }
 
-/* ===================== 继续回答按钮 ===================== */
-.continue-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.continue-btn {
-    font-size: 0.82rem;
-    padding: 0.25rem 0.65rem;
-    border-radius: 999px;
-    transition: all var(--duration) var(--ease);
-}
-
-.continue-btn:hover {
-    transform: scale(1.03);
-}
-
 /* 侧边栏新建按钮 */
 #newConvBtn {
     color: var(--amber);

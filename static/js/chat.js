@@ -72,6 +72,7 @@
 
     let streaming = false; // 是否正在接收流（防止并发）
     let userStopped = false; // 用户是否主动点击停止
+    let stopHandler = null; // 停止按钮的 click handler（用于移除）
 
     // ---------- 会话管理 ----------
     let currentConvId = null; // 当前会话 id
@@ -381,6 +382,9 @@
     async function ask(question) {
         if (streaming) return;
         streaming = true;
+        // AbortController 必须在 setSending 之前创建，否则停止按钮点击时 controller 还不存在
+        const controller = new AbortController();
+        window._chatAbortController = controller;
         setSending(true);
         const thinking = thinkingToggle.checked;
         statusHint.textContent = thinking ? "深度思考中..." : "正在检索文档...";
@@ -426,11 +430,13 @@
                 } catch {}
             },
             reasoning: (raw) => {
+                if (userStopped) return;
                 fullReasoning += raw;
                 updateReasoning();
                 if (statusHint.textContent === "正在检索文档...") statusHint.textContent = "正在推理...";
             },
             token: (raw) => {
+                if (userStopped) return;
                 // 首个正式 token 到达 → 推理阶段结束，收起推理面板，让正文成为焦点
                 if (!reasoningDone && fullAnswer === "") {
                     reasoningDone = true;
@@ -444,6 +450,7 @@
                 }
             },
             answer_final: (raw) => {
+                if (userStopped) return;
                 try {
                     const obj = JSON.parse(raw);
                     if (obj && typeof obj.answer === "string") fullAnswer = obj.answer;
@@ -457,6 +464,7 @@
                 updateContent();
             },
             done: (raw) => {
+                if (userStopped) return;
                 let cacheTag = "";
                 try {
                     const obj = JSON.parse(raw);
@@ -484,13 +492,11 @@
         try {
             const token = Token.get();
             // AbortController：60s 无数据则中止（防后端卡死），每收到帧重置
-            const controller = new AbortController();
             let abortTimer;
             const resetAbortTimer = () => {
                 clearTimeout(abortTimer);
                 abortTimer = setTimeout(() => controller.abort(), 60000);
             };
-            window._chatAbortController = controller; // beforeunload 时可引用
 
             const resp = await fetch(ENDPOINTS.chat.ask, {
                 method: "POST",
@@ -529,14 +535,28 @@
             if (cursor) cursor.remove();
         } catch (err) {
             clearTimeout(abortTimer);
+            // 用 appendChild 替代 innerHTML+=，避免序列化重建 DOM 时把 cursor 带回来
             if (err.name === "AbortError") {
-                contentEl.innerHTML += `<div class="text-muted small mt-2"><i class="bi bi-clock-history me-1"></i>已中断（超时或离开页面）</div>`;
-                statusHint.textContent = "已中断";
+                if (userStopped) {
+                    const hint = document.createElement("div");
+                    hint.className = "text-muted small mt-2";
+                    hint.innerHTML = '<i class="bi bi-stop-circle me-1"></i>已停止';
+                    contentEl.appendChild(hint);
+                    statusHint.textContent = "已停止";
+                } else {
+                    const hint = document.createElement("div");
+                    hint.className = "text-muted small mt-2";
+                    hint.innerHTML = '<i class="bi bi-clock-history me-1"></i>已中断（超时或离开页面）';
+                    contentEl.appendChild(hint);
+                    statusHint.textContent = "已中断";
+                }
             } else {
                 contentEl.innerHTML = `<div class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(err.message)}</div>`;
                 statusHint.textContent = "出错";
             }
         } finally {
+            // 三层防线兜底：无论正常结束/异常/停止，都清理打字光标
+            contentEl.querySelectorAll(".typing-cursor").forEach((el) => el.remove());
             streaming = false;
             setSending(false);
             if (statusHint.textContent === "正在检索文档..." || statusHint.textContent === "正在生成回答..." || statusHint.textContent === "正在推理...") {
@@ -546,9 +566,36 @@
     }
 
     function setSending(sending) {
-        sendBtn.disabled = sending;
-        questionInput.disabled = sending;
-        if (!sending) questionInput.focus();
+        if (sending) {
+            // 发送 → 停止：变红、改图标、切 type 防 form submit
+            sendBtn.classList.remove("btn-primary");
+            sendBtn.classList.add("btn-danger");
+            sendBtn.innerHTML = '<i class="bi bi-stop-fill"></i> 停止';
+            sendBtn.type = "button";
+            sendBtn.disabled = false; // 停止按钮必须可点
+            questionInput.disabled = true;
+            userStopped = false;
+            // 绑定停止事件
+            stopHandler = (e) => {
+                e.preventDefault();
+                userStopped = true;
+                window._chatAbortController?.abort();
+            };
+            sendBtn.addEventListener("click", stopHandler);
+        } else {
+            // 停止 → 发送：恢复原样
+            if (stopHandler) {
+                sendBtn.removeEventListener("click", stopHandler);
+                stopHandler = null;
+            }
+            sendBtn.classList.remove("btn-danger");
+            sendBtn.classList.add("btn-primary");
+            sendBtn.innerHTML = '<i class="bi bi-send"></i> 发送';
+            sendBtn.type = "submit";
+            sendBtn.disabled = false;
+            questionInput.disabled = false;
+            questionInput.focus();
+        }
     }
 
     // ---------- 事件绑定 ----------

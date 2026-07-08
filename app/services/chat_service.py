@@ -139,10 +139,6 @@ async def stream_graph(
                     state = await transform_query(state)
                     continue  # 用变体重查
                 break
-            # 循环结束后只推送一次 sources（避免前端弱结果→好结果闪烁）
-            if state.get("sources"):
-                yield ("sources", state["sources"])
-
             # 构造生成消息：高相关走 RAG；低相关尝试联网搜索兜底，否则 fallback
             question_text = state["question"]
             history_list = state.get("history", [])
@@ -152,15 +148,16 @@ async def stream_graph(
             top_score = sources[0].get("score", 0) if sources else 0
 
             if docs and top_score >= settings.retrieval_score_threshold:
+                # 高相关：推送完整 sources 给前端 + 存 DB
+                if sources:
+                    yield ("sources", sources)
                 messages = _build_rag_prompt(question_text, docs, history_list, summary_text)
             else:
                 web_context = await _try_web_search(state, enable_web_search=enable_web_search)
                 if web_context:
                     # 联网搜索触发时，给前端可观测事件 + 历史来源标记
                     yield ("web_search", {"used": True, "query": state.get("transformed_query") or state.get("rewritten_query") or question_text, "preview": web_context[:300]})
-                    if sources is None:
-                        sources = []
-                    sources = [*sources, {"filename": "联网搜索结果", "source": "web"}]
+                    sources = [{"filename": "联网搜索结果", "source": "web"}]
                     state["sources"] = sources
                     yield ("sources", sources)
                     messages = _build_web_search_prompt(
@@ -168,7 +165,10 @@ async def stream_graph(
                         history=history_list, summary=summary_text,
                     )
                 else:
+                    # fallback：低分 sources 不推送（回答说"文档未涉及"，附来源自相矛盾）
                     yield ("web_search", {"used": False})
+                    state["sources"] = []
+                    yield ("sources", [])
                     messages = _build_fallback_prompt(question_text, docs, history_list, summary_text)
 
         # 分支 C：纯对话（general 路径）：摘要也注入，保持长对话连贯

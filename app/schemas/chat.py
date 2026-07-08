@@ -14,13 +14,6 @@ class ChatAskRequest(BaseModel):
     enable_web_search: bool = True
 
 
-class ChatContinueRequest(BaseModel):
-    """继续回答被中断的 partial 消息。"""
-    message_id: int
-    conversation_id: int
-    thinking: bool = False
-
-
 class SourceItem(BaseModel):
     document_id: int | None = None
     filename: str = ""
@@ -37,7 +30,6 @@ class MessageOut(BaseModel):
     content: str
     sources: list[SourceItem] = []
     reasoning: str | None = None
-    status: str = "complete"
     created_at: datetime | None = None
 
 

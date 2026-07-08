@@ -34,8 +34,6 @@ async def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_user_hash "
             "ON documents(user_id, file_hash)"
         ))
-        # 消息状态：complete(完整) / partial(用户中断)
-        await _ensure_column(conn, "messages", "status", "TEXT DEFAULT 'complete'")
 
 
 async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:
