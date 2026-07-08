@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import String, Integer, DateTime, ForeignKey, func
+from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -17,6 +17,8 @@ class Document(Base):
     file_size: Mapped[int] = mapped_column(Integer, default=0)
     # 文件内容 sha256，用于用户内去重（联合唯一索引见 database.py）
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 文档引用说明：LLM 生成的 2-3 句话摘要，拼接到每个 chunk 前面，解决 meta-question 检索盲区
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 文档处理状态：pending(已入库待处理) / processing(解析中) / done(完成) / failed(失败)
     # 默认 done 兼容旧数据（init_db 给旧库补列时 status 为 NULL，应用层兜底视为 done）
     status: Mapped[str] = mapped_column(String(20), default="done", server_default="done")

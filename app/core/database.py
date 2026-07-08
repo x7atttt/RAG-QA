@@ -34,6 +34,8 @@ async def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_user_hash "
             "ON documents(user_id, file_hash)"
         ))
+        # 文档引用说明：LLM 生成的摘要，拼接到 chunk 前面（stage-18）
+        await _ensure_column(conn, "documents", "summary", "TEXT")
 
 
 async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:

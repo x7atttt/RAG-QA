@@ -23,6 +23,37 @@ logger = logging.getLogger("docqa.document")
 
 SUPPORTED_EXTS = {"pdf", "docx", "md"}
 
+
+async def _generate_doc_summary(text: str, filename: str) -> str:
+    """用 LLM 生成文档引用说明（2-3 句话），拼接到 chunk 前面解决 meta-question 检索盲区。
+
+    失败时降级用文件名，不阻断入库流程。
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from app.services.llm_provider import chat
+
+    # 取前 2000 字作为摘要输入（太长浪费 token，摘要只需了解文档主题）
+    preview = text[:2000]
+    messages = [
+        SystemMessage(content=(
+            "你是文档摘要助手。根据文档内容，用 2-3 句话（不超过 100 字）描述这份文档的主题和内容类型。\n"
+            "要求：\n"
+            "1) 说明文档是什么（如'一份个人简历''一份技术方案''一份会议纪要'）；\n"
+            "2) 列出主要内容板块（如'包含教育背景、技能清单、项目经历'）；\n"
+            "3) 只输出摘要文本，不要任何前缀或解释。"
+        )),
+        HumanMessage(content=f"文件名：{filename}\n\n文档内容：\n{preview}"),
+    ]
+    try:
+        summary = await asyncio.to_thread(chat, messages, max_tokens=150)
+        summary = summary.strip().strip("\"'""''")
+        if summary and len(summary) > 10:
+            return summary
+    except Exception as e:
+        logger.warning(f"文档摘要生成失败，降级用文件名: {e}")
+    # 降级：用文件名
+    return filename
+
 _chroma_client: chromadb.api.ClientAPI | None = None
 _chroma_lock = asyncio.Lock()
 # MinerU 云 API 并发限制：防批量上传时打到云 API 触发限流/静默降级
@@ -287,6 +318,11 @@ async def process_pending_document(
             if not text:
                 raise RuntimeError("解析内容为空（可能是扫描版 PDF 且 OCR 失败）")
 
+            # 生成文档引用说明（拼接到 chunk 前面，解决 meta-question 检索盲区）
+            summary = await _generate_doc_summary(text, doc.filename)
+            doc.summary = summary
+            logger.info(f"文档 {document_id} ({doc.filename}) 引用说明: {summary[:60]}...")
+
             chunks = await asyncio.to_thread(
                 split_text, text, settings.split_strategy,
                 settings.chunk_size, settings.chunk_overlap, ext,
@@ -294,9 +330,16 @@ async def process_pending_document(
             if not chunks:
                 raise RuntimeError("分块结果为空")
 
+            # 引用说明拼接到每个 chunk 前面（让 chunk embedding 包含文档高层描述）
+            # 注意：hash 基于原始 chunk 计算，summary 只在存储时拼接
+            if summary:
+                embed_chunks = [f"[来源: {doc.filename}] {summary}\n{c}" for c in chunks]
+            else:
+                embed_chunks = chunks
+
             if replace_id is not None:
-                # 增量更新：diff 新旧分块，仅重算变化块
-                stats = await update_document_chunks(doc, chunks, user_id, db)
+                # 增量更新：用原始 chunks 做 hash diff（不含 summary，避免 hash 全变）
+                stats = await update_document_chunks(doc, chunks, user_id, db, summary=summary)
                 logger.info(
                     f"文档 {document_id} ({doc.filename}) 增量更新完成，"
                     f"+{stats['added']} -{stats['removed']} 复用{stats['reused']}"
@@ -304,12 +347,12 @@ async def process_pending_document(
                 )
             else:
                 # 新建文档：全量 embedding + add
-                embeddings = await encode_texts(chunks)
+                embeddings = await encode_texts(embed_chunks)
                 async with _chroma_lock:
                     collection = get_user_collection(user_id)
                     ids = [f"{doc.id}_chunk_{i}" for i in range(len(chunks))]
                     metadatas = _build_chunk_metadata(user_id, doc.id, doc.filename, chunks)
-                    collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+                    collection.add(ids=ids, documents=embed_chunks, embeddings=embeddings, metadatas=metadatas)
                 doc.chunk_count = len(chunks)
 
             doc.status = "done"
@@ -363,7 +406,8 @@ async def process_document(
     if not chunks:
         raise BizError(code=ResponseCode.DOC_PARSE_FAILED, message="文档内容为空", http_status=400)
 
-    embeddings = await encode_texts(chunks)
+    # 生成文档引用说明
+    summary = await _generate_doc_summary(text, filename)
 
     document = Document(
         user_id=user_id,
@@ -372,18 +416,26 @@ async def process_document(
         chunk_count=len(chunks),
         file_size=file_size,
         file_hash=file_hash,
+        summary=summary,
         status="done",
     )
     db.add(document)
     await db.commit()
     await db.refresh(document)
 
+    # 引用说明拼接到 chunk 前面
+    if summary:
+        embed_chunks = [f"[来源: {filename}] {summary}\n{c}" for c in chunks]
+    else:
+        embed_chunks = chunks
+    embeddings = await encode_texts(embed_chunks)
+
     try:
         async with _chroma_lock:
             collection = get_user_collection(user_id)
             ids = [f"{document.id}_chunk_{i}" for i in range(len(chunks))]
             metadatas = _build_chunk_metadata(user_id, document.id, filename, chunks)
-            collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+            collection.add(ids=ids, documents=embed_chunks, embeddings=embeddings, metadatas=metadatas)
     except Exception:
         await db.delete(document)
         await db.commit()
@@ -393,7 +445,7 @@ async def process_document(
 
 
 async def update_document_chunks(
-    document: Document, new_chunks: list[str], user_id: int, db: AsyncSession
+    document: Document, new_chunks: list[str], user_id: int, db: AsyncSession, summary: str | None = None,
 ) -> dict:
     """文档增量更新：按分块 content_hash 集合 diff，仅对变化块重算向量。
 
@@ -438,7 +490,7 @@ async def update_document_chunks(
     union_size = len(new_hash_set | old_hash_set)
     changed_ratio = (len(added_hashes) + len(removed_hashes)) / max(union_size, 1)
     if changed_ratio > settings.incremental_update_threshold:
-        stats = await _full_rebuild_chunks(document, new_chunks, user_id, db)
+        stats = await _full_rebuild_chunks(document, new_chunks, user_id, db, summary=summary)
         stats["degraded"] = True
         logger.info(
             f"文档 {document.id} 变化率 {changed_ratio:.0%} > 阈值，降级全量重建"
@@ -459,6 +511,9 @@ async def update_document_chunks(
             collection.delete(ids=removed_ids)
         if added_chunks:
             added_texts = [c for _, c in added_chunks]
+            # 引用说明拼接到新增 chunk 前面
+            if summary:
+                added_texts = [f"[来源: {document.filename}] {summary}\n{t}" for t in added_texts]
             added_embeddings = await encode_texts(added_texts)
             # 新增块用位置 id（_chunk_{i}），与旧块 id 空间不冲突（旧块的对应位置
             # 要么已删除要么是复用块——复用块 id 仍在但 hash 不同会作为 added 重算）
@@ -496,21 +551,26 @@ async def update_document_chunks(
 
 
 async def _full_rebuild_chunks(
-    document: Document, chunks: list[str], user_id: int, db: AsyncSession
+    document: Document, chunks: list[str], user_id: int, db: AsyncSession, summary: str | None = None,
 ) -> dict:
     """全量重建：删旧文档所有块 + 重新 add 全部新块（含 content_hash）。
 
     增量更新的降级路径（变化率超阈值或旧数据无 content_hash 时触发）。
     """
+    # 引用说明拼接到 chunk 前面
+    if summary:
+        embed_chunks = [f"[来源: {document.filename}] {summary}\n{c}" for c in chunks]
+    else:
+        embed_chunks = chunks
     async with _chroma_lock:
         collection = get_user_collection(user_id)
         # 删旧
         collection.delete(where={"document_id": document.id})
         # 重算全部 + 入库
-        embeddings = await encode_texts(chunks)
+        embeddings = await encode_texts(embed_chunks)
         ids = [f"{document.id}_chunk_{i}" for i in range(len(chunks))]
         metadatas = _build_chunk_metadata(user_id, document.id, document.filename, chunks)
-        collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
+        collection.add(ids=ids, documents=embed_chunks, embeddings=embeddings, metadatas=metadatas)
 
     document.chunk_count = len(chunks)
     await db.commit()
