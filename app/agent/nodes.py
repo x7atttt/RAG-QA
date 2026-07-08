@@ -318,8 +318,6 @@ async def retrieve_documents(state: AgentState) -> AgentState:
         )
 
     state["retrieved_docs"] = retrieved_docs
-    # 候选池：rerank 前的 top-20，fallback 路径用更多上下文（避免低分但相关的 chunk 被截断）
-    state["fallback_docs"] = fused_candidates
     state["sources"] = sources
     return state
 
