@@ -325,8 +325,8 @@
     // ---------- 来源标注（气泡内顶部 chip 标签，纯展示）----------
     function renderSources(areaEl, sources) {
         if (!sources || !sources.length) return;
-        // 提取不重复的文件名（多个 chunk 可能来自同一文档）
-        const names = [...new Set(sources.map((s) => s.filename).filter(Boolean))];
+        // 提取不重复的文件名（多个 chunk 可能来自同一文档），跳过联网搜索（由 renderWebSearchBadge 单独处理）
+        const names = [...new Set(sources.filter((s) => s.source !== "web").map((s) => s.filename).filter(Boolean))];
         if (!names.length) return;
         const chips = names
             .map((n) => `<span class="source-chip"><i class="bi bi-file-earmark-text me-1"></i>${escapeHtml(n)}</span>`)
