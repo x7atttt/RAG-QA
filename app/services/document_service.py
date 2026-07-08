@@ -45,7 +45,7 @@ async def _generate_doc_summary(text: str, filename: str) -> str:
         HumanMessage(content=f"文件名：{filename}\n\n文档内容：\n{preview}"),
     ]
     try:
-        summary = await asyncio.to_thread(chat, messages, max_tokens=150)
+        summary = await chat(messages, max_tokens=150)
         summary = summary.strip().strip("\"'""''")
         if summary and len(summary) > 10:
             return summary
