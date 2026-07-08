@@ -205,6 +205,7 @@ async def _run_doc_meta(state: AgentState) -> list:
     独立成函数：工具调用 + DB 查询 + prompt 构造的内聚封装。
     DB session 在此处按需开（不触发改工具分支时不开），不影响其他分支。
     """
+    from app.agent.nodes import _build_doc_meta_prompt
     from app.services.tools.doc_meta import format_for_prompt, query_doc_meta
 
     user_id = state["user_id"]
