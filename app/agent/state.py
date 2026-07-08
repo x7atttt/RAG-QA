@@ -37,6 +37,8 @@ class AgentState(TypedDict, total=False):
     web_search_result: str
     # 检索
     retrieved_docs: list[str]
+    # 候选池（rerank 前的 top-20），供 fallback 路径使用更多上下文
+    fallback_docs: list[str]
     sources: list[SourceItem]
     # 多轮上下文：最近 N 轮历史（正序，最旧在前）
     history: list[HistoryItem]

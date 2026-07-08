@@ -74,6 +74,7 @@ async def stream_graph(
         "doc_meta_result": "",
         "web_search_result": "",
         "retrieved_docs": [],
+        "fallback_docs": [],
         "sources": [],
         "answer_tokens": [],
         "answer": "",
@@ -165,11 +166,12 @@ async def stream_graph(
                         history=history_list, summary=summary_text,
                     )
                 else:
-                    # fallback：低分 sources 不推送（回答说"文档未涉及"，附来源自相矛盾）
+                    # fallback：展示 sources（检索事实），用候选池（top-20）做上下文
                     yield ("web_search", {"used": False})
-                    state["sources"] = []
-                    yield ("sources", [])
-                    messages = _build_fallback_prompt(question_text, docs, history_list, summary_text)
+                    if sources:
+                        yield ("sources", sources)
+                    fallback_context = state.get("fallback_docs", docs)
+                    messages = _build_fallback_prompt(question_text, fallback_context, history_list, summary_text)
 
         # 分支 C：纯对话（general 路径）：摘要也注入，保持长对话连贯
         else:
