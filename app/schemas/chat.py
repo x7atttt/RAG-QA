@@ -20,6 +20,7 @@ class SourceItem(BaseModel):
     chunk_index: int = 0
     content: str = ""
     score: float = 0.0
+    source: str = ""  # "web" 标记联网搜索结果，前端据此过滤重复 badge
 
 
 class MessageOut(BaseModel):
