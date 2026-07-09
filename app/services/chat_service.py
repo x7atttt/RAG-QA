@@ -32,8 +32,8 @@ async def stream_graph(
     """yield (event_name, payload). event ∈ reasoning/token/sources/done/error.
 
     手动编排（不走 graph.astream_events），编排顺序（spec/20260706-tool-calling.md）：
-    1. intent_router → 判断要不要检索（内容层）
-    2. tool_router → 判断是不是元信息问题（元层），是则调 doc_meta 工具跳过检索
+    1. tool_router → 显式联网搜索命令/文档元信息问题（优先判断，跳过检索链路）
+    2. intent_router → 判断要不要检索（内容层），仅 tool_call=None 时执行
     3. 若需检索：rewrite_query + CRAG 循环重查 → 推 sources
     4. CRAG 仍失败 + 开启联网搜索 → 调 web_search 兜底
     5. 选 prompt（rag / fallback / web_search / doc_meta / 纯对话）→ astream_chat 流式生成

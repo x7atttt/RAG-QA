@@ -51,8 +51,9 @@ async def intent_router(state: AgentState) -> AgentState:
 async def tool_router(state: AgentState) -> AgentState:
     """工具路由（spec/20260706-tool-calling.md 决策 3）：判断是否调文档元信息工具。
 
-    定位：串在 intent_router 之后。intent_router 判"要不要检索"（内容层），
-    tool_router 判"是不是元信息问题"（元层）。两者职责分离，每节点一件事。
+    定位：串在 intent_router 之前（显式命令优先）。tool_router 先判断是否是
+    联网搜索命令或文档元信息问题，都不是才走 intent_router 判断要不要检索。
+    两者职责分离，每节点一件事。
 
     元层问题示例：
       - "我上传过哪些文档/PDF/Markdown"
